@@ -1,0 +1,18 @@
+schema_version: 2
+id: 260922-2126-fix-cursor-mcp-tool-discovery-protocol-freeze
+title: Fix Cursor MCP tool discovery protocol freeze
+kind: work-item
+work_type: bug
+parent: null
+route: quick-plan
+status: planned
+superseded_by: null
+created_at: '2026-09-22T21:26:47+02:00'
+updated_at: '2026-09-22T21:26:47+02:00'
+external_refs:
+- system: github
+  type: commit
+  key: 1b220a4f65554ffb3a505a5df92a2eebf2d60545
+  url: https://github.com/can1357/oh-my-pi/commit/1b220a4f65554ffb3a505a5df92a2eebf2d60545
+wiki_refs:
+- wiki/raw/cursor-mcp-tool-discovery-freeze-handoff.md

@@ -11,6 +11,7 @@ Repository-local planning and execution artifacts.
 <!-- spec-items:active:start -->
 | Item | Kind | Status | Updated |
 | --- | --- | --- | --- |
+| [Fix Cursor MCP tool discovery protocol freeze](./active/260922-2126-fix-cursor-mcp-tool-discovery-protocol-freeze/plan.md) | work-item | planned | 2026-09-22 |
 <!-- spec-items:active:end -->
 
 ## Archive
