@@ -9,6 +9,12 @@ Durable current-state codebase knowledge. Read this file first when answering co
 - [Wiki state](./state.md): Ingest and maintenance state.
 - [Raw sources](./raw/README.md): Rules for untrusted raw inputs.
 
+## Dream history
+
+- [Episode catalog](./dreams/episodes.jsonl): Metadata-only routing to immutable session logs.
+- `wiki/dreams/by-spec/<item-id>.md`: Append-only Gamemaster checkpoint ledgers.
+- `wiki/dreams/retrospectives/<item-id>.md`: Append-only planning and whole-lifecycle workflow retrospectives.
+
 ## Project knowledge
 
 - [Project overview](./overview.md): Purpose, users, deliverable, stack, and repository boundaries.
@@ -25,5 +31,4 @@ Durable current-state codebase knowledge. Read this file first when answering co
 
 ## Stale or needs review
 
-- **Unverified:** `proto/agent_pb.ts` is generated, but the source schema and regeneration command are not tracked.
-- **Unverified:** Initial-ingest type-check was not run because project dependencies were not installed.
+- None currently recorded. The initial-ingest schema and type-check gaps were superseded by the tracked generation workflow and focused offline checks for the Cursor MCP protocol repair.

@@ -61,7 +61,7 @@ pi  →  openai-completions  →  localhost:PORT/v1/chat/completions
 1. **PKCE OAuth** — browser-based login to Cursor, no client secret needed
 2. **Model discovery** — queries Cursor's `GetUsableModels` gRPC endpoint
 3. **Local proxy** — translates OpenAI `/v1/chat/completions` to Cursor's protobuf/HTTP2 Connect protocol
-4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP
+4. **Tool routing** — rejects Cursor's native tools, exposes pi's tools via MCP, and answers Cursor's field-36 MCP state discovery from the same advertised tool catalog
 
 ## Security
 
@@ -79,7 +79,7 @@ This is not a sandbox against code already running as your user. Extensions have
 | `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` | `300000` | Kill bridge if no HTTP/2 activity for this many ms after the first frame |
 | `PI_CURSOR_BRIDGE_PING_INTERVAL_MS` | `15000` | HTTP/2 PING interval to detect dead connections |
 | `PI_CURSOR_BRIDGE_PING_TIMEOUT_MS` | `10000` | Timeout for each HTTP/2 PING before declaring the connection dead |
-| `PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS` | `120000` | Kill bridge if no data received from Cursor within this many ms |
+| `PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS` | `120000` | Bound both wire-idle detection and an unanswered control-exec watchdog; delegated `mcpArgs` tool execution is excluded from the control watchdog |
 | `PI_CURSOR_MAX_BRIDGE_RETRIES` | `2` | Max transparent retries on transient Cursor errors or bridge crashes |
 | `PI_CURSOR_TURN_ARCHIVE_THRESHOLD` | `20` | Keep this many recent turns as raw blobs; older turns are archived as inline text |
 | `PI_CURSOR_RAW_MODELS` | off | Set to disable model deduplication and see all raw Cursor model IDs |
@@ -340,6 +340,28 @@ HOME="$(mktemp -d)" node scripts/smoke-package.mjs
 npm pack
 ```
 
+### Cursor protocol bindings
+
+The complete vendored schema is `proto/agent.proto`. It is pinned to oh-my-pi
+commit `1b220a4f65554ffb3a505a5df92a2eebf2d60545` and carries three documented
+local compatibility declarations. Source, local-delta, and MIT attribution are
+recorded in [`proto/ATTRIBUTION.md`](proto/ATTRIBUTION.md), which is included in
+the published package.
+
+Regeneration requires `protoc` on `PATH`; the development dependency
+`@bufbuild/protoc-gen-es` is pinned to `2.10.2`:
+
+```bash
+npm run proto:generate
+```
+
+Never hand-edit `proto/agent_pb.ts`. Review the complete generated diff and run
+the command twice with a byte-for-byte comparison when updating the schema.
+The current runtime intentionally supports only an explicit exec allowlist:
+MCP state discovery is answered locally, `mcpArgs` is delegated to Pi, and
+unsupported decoded or future unknown exec cases terminate with a sanitized
+provider error rather than receiving a guessed response.
+
 Live tests send only synthetic prompts and require explicit opt in plus existing Cursor authentication:
 
 ```bash
@@ -359,6 +381,10 @@ npm run debug:timeline -- /path/to/pi-cursor-provider-debug-2026-04-08T14-06-07-
 ```
 
 Add `--json` if you want the parsed summary as JSON instead of formatted text.
+The concise timeline elevates exec receipt, response or delegation, unknown
+field metadata, control-watchdog expiry, protocol termination, and stream stall
+timeouts. Unknown protocol diagnostics include only field number, wire type,
+and byte length; they never include the retained raw bytes.
 
 ## Credits
 

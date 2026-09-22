@@ -32,6 +32,7 @@ import {
 } from "./proxy.ts";
 import type { CursorModel, ParsedTurn } from "./proxy.ts";
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
   AgentClientMessageSchema,
   type AgentRunRequestSchema,
@@ -42,9 +43,14 @@ import {
   ConversationTurnStructureSchema,
   ConversationStepSchema,
   ExecServerMessageSchema,
+  type ExecServerMessage,
   InteractionUpdateSchema,
   KvServerMessageSchema,
+  ListMcpResourcesExecArgsSchema,
   McpArgsSchema,
+  McpStateExecArgsSchema,
+  McpToolDefinitionSchema,
+  RequestContextArgsSchema,
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   UserMessageSchema,
@@ -1523,35 +1529,55 @@ function makeSetBlobMessage(blobId: Uint8Array, blobData: Uint8Array) {
   });
 }
 
+function makeExecMessage(
+  id: number,
+  execId: string,
+  message: ExecServerMessage["message"],
+) {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "execServerMessage",
+      value: create(ExecServerMessageSchema, { id, execId, message }),
+    },
+  });
+}
+
 function makeMcpExecMessage(
   toolCallId: string,
   toolName: string,
   args: Record<string, string>,
 ) {
-  return create(AgentServerMessageSchema, {
-    message: {
-      case: "execServerMessage",
-      value: create(ExecServerMessageSchema, {
-        id: 1,
-        execId: "exec-1",
-        message: {
-          case: "mcpArgs",
-          value: create(McpArgsSchema, {
-            name: toolName,
-            toolName,
-            toolCallId,
-            providerIdentifier: "pi",
-            args: Object.fromEntries(
-              Object.entries(args).map(([key, value]) => [
-                key,
-                new TextEncoder().encode(value),
-              ]),
-            ),
-          }),
-        },
-      }),
-    },
+  return makeExecMessage(1, "exec-1", {
+    case: "mcpArgs",
+    value: create(McpArgsSchema, {
+      name: toolName,
+      toolName,
+      toolCallId,
+      providerIdentifier: "pi",
+      args: Object.fromEntries(
+        Object.entries(args).map(([key, value]) => [
+          key,
+          new TextEncoder().encode(value),
+        ]),
+      ),
+    }),
   });
+}
+
+function makeUnknownExecMessage(secret = "private-future-payload") {
+  const execBytes = new BinaryWriter()
+    .tag(1, WireType.Varint)
+    .uint32(91)
+    .tag(15, WireType.LengthDelimited)
+    .string("future-exec")
+    .tag(60, WireType.LengthDelimited)
+    .bytes(new TextEncoder().encode(secret))
+    .finish();
+  const agentBytes = new BinaryWriter()
+    .tag(2, WireType.LengthDelimited)
+    .bytes(execBytes)
+    .finish();
+  return fromBinary(AgentServerMessageSchema, agentBytes);
 }
 
 async function postChatCompletion(port: number, body: Record<string, unknown>) {
@@ -1666,6 +1692,138 @@ describe("proxy integration — session handling", () => {
 
     const stored = __testInternals.conversationStates.get(convKey);
     expect(stored?.checkpoint).toBeTruthy();
+  });
+
+  test("MCP discovery answers field 36 locally, delegates only the real tool, and completes after resume", async () => {
+    const execClientMessages: any[] = [];
+    const bridges: FakeBridge[] = [];
+
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case === "runRequest") {
+          fake.emitServerMessage(makeExecMessage(10, "context", {
+            case: "requestContextArgs",
+            value: create(RequestContextArgsSchema, {}),
+          }));
+          return;
+        }
+        if (clientMessage.message.case !== "execClientMessage") return;
+        const exec = clientMessage.message.value;
+        execClientMessages.push(exec);
+        if (exec.message.case === "requestContextResult") {
+          fake.emitServerMessage(makeExecMessage(20, "state", {
+            case: "mcpStateExecArgs",
+            value: create(McpStateExecArgsSchema, {
+              serverIdentifiers: ["pi"],
+              kickOnly: true,
+            }),
+          }));
+        } else if (exec.message.case === "mcpStateExecResult") {
+          fake.emitServerMessage(makeMcpExecMessage("tc-discovery", "read", {
+            path: "package.json",
+          }));
+        } else if (exec.message.case === "mcpResult") {
+          queueMicrotask(() => {
+            fake.emitServerMessage(makeTextDeltaMessage("package inspected"));
+            fake.emitServerMessage(makeCheckpointMessage());
+            fake.close(0);
+          });
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+
+    const sessionId = "session-mcp-discovery";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const port = await startProxy(async () => "test-token");
+    const first = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "inspect package" }],
+      tools: [
+        { type: "function", function: { name: "read", description: "Read a file", parameters: { type: "object" } } },
+        { type: "function", function: { name: "grep", description: "Search files", parameters: { type: "object" } } },
+      ],
+    });
+
+    expect(first.statusCode).toBe(200);
+    expect(first.body).toContain('"id":"tc-discovery"');
+    expect(first.body).toContain('"finish_reason":"tool_calls"');
+    expect(execClientMessages.map((message) => message.message.case)).toEqual([
+      "requestContextResult",
+      "mcpStateExecResult",
+    ]);
+    const contextTools = execClientMessages[0].message.value.result.value.requestContext.tools;
+    const stateResult = execClientMessages[1];
+    expect(stateResult.id).toBe(20);
+    expect(stateResult.execId).toBe("state");
+    expect(stateResult.message.value.result.case).toBe("success");
+    const servers = stateResult.message.value.result.value.servers;
+    expect(servers).toHaveLength(1);
+    expect(servers[0]).toMatchObject({
+      serverName: "pi",
+      serverIdentifier: "pi",
+      instructions: [],
+      status: "connected",
+    });
+    expect(servers[0].plugin).toBeUndefined();
+    expect(servers[0].marketplace).toBeUndefined();
+    expect(servers[0].tools.map((tool: any) =>
+      toBinary(McpToolDefinitionSchema, tool))).toEqual(
+      contextTools.map((tool: any) => toBinary(McpToolDefinitionSchema, tool)),
+    );
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(true);
+
+    const second = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "inspect package" },
+        { role: "assistant", content: null, tool_calls: [{
+          id: "tc-discovery",
+          type: "function",
+          function: { name: "read", arguments: '{"path":"package.json"}' },
+        }] },
+        { role: "tool", content: "package contents", tool_call_id: "tc-discovery" },
+      ],
+    });
+
+    expect(second.statusCode).toBe(200);
+    expect(second.body).toContain("package inspected");
+    expect(execClientMessages.map((message) => message.message.case)).toEqual([
+      "requestContextResult",
+      "mcpStateExecResult",
+      "mcpResult",
+    ]);
+    expect(bridges).toHaveLength(1);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+  });
+
+  test("MCP state filtering preserves stable groups and returns empty success for absent servers", async () => {
+    const results: any[] = [];
+    setBridgeFactoryForTests((options) => new FakeBridge(options, (clientMessage, fake) => {
+      if (clientMessage.message.case === "runRequest") {
+        fake.emitServerMessage(makeExecMessage(1, "state-empty", {
+          case: "mcpStateExecArgs",
+          value: create(McpStateExecArgsSchema, { serverIdentifiers: ["absent"] }),
+        }));
+      } else if (clientMessage.message.case === "execClientMessage") {
+        results.push(clientMessage.message.value);
+        fake.close(0);
+      }
+    }));
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      messages: [{ role: "user", content: "inspect" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+    });
+    expect(response.statusCode).toBe(200);
+    expect(results).toHaveLength(1);
+    expect(results[0].message.case).toBe("mcpStateExecResult");
+    expect(results[0].message.value.result.case).toBe("success");
+    expect(results[0].message.value.result.value.servers).toEqual([]);
   });
 
   test("partial tool-result batches stay in-flight until all pending tool results arrive", async () => {
@@ -2324,6 +2482,64 @@ describe("proxy integration — session handling", () => {
 });
 
 describe("proxy hang fixes", () => {
+  test.each([
+    { stream: true, kind: "unknown" as const },
+    { stream: false, kind: "unknown" as const },
+    { stream: true, kind: "decoded" as const },
+    { stream: false, kind: "decoded" as const },
+  ])("$kind exec fails terminally exactly once when stream=$stream", async ({ stream, kind }) => {
+    const bridges: FakeBridge[] = [];
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case !== "runRequest") return;
+        // A protocol-failed partial turn must not replace the pre-turn checkpoint.
+        fake.emitServerMessage(makeCheckpointMessage());
+        fake.emitServerMessage(kind === "unknown"
+          ? makeUnknownExecMessage()
+          : makeExecMessage(92, "decoded-unsupported", {
+              case: "listMcpResourcesExecArgs",
+              value: create(ListMcpResourcesExecArgsSchema, {}),
+            }));
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+
+    const sessionId = `protocol-${kind}-${stream}`;
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const priorCheckpoint = toBinary(
+      ConversationStateStructureSchema,
+      create(ConversationStateStructureSchema, { clientName: "last-good" }),
+    );
+    __testInternals.conversationStates.set(convKey, {
+      conversationId: `conv-${kind}-${stream}`,
+      checkpoint: priorCheckpoint,
+      blobStore: new Map(),
+    });
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      stream,
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "synthetic" }],
+    });
+
+    expect(bridges).toHaveLength(1);
+    expect(response.statusCode).toBe(stream ? 200 : 502);
+    expect(response.body.match(/cursor_protocol_error/g)).toHaveLength(1);
+    expect(response.body).not.toContain("private-future-payload");
+    expect(response.body.match(/\[DONE\]/g) ?? []).toHaveLength(stream ? 1 : 0);
+    expect(bridges[0]!.clientMessages.filter(
+      (message) => message.message.case === "conversationAction",
+    )).toHaveLength(1);
+    expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.sessionBridges.has(bridgeKey)).toBe(false);
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(
+      priorCheckpoint,
+    );
+  });
+
   test("non-streaming: exec requests are rejected immediately so the bridge closes and the response resolves", async () => {
     const execClientMessages: any[] = [];
 

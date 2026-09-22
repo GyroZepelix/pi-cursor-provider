@@ -98,28 +98,28 @@ Add compact debug events that contain request and bridge identifiers, exec messa
 
 ## Work breakdown
 
-- [ ] T01: Establish reproducible current Cursor bindings.
+- [x] T01: Establish reproducible current Cursor bindings.
   - Depends on: explicit approval to add the pinned development dependency.
   - Scope: add the pinned schema and attribution, generator dependency and script, regenerate `proto/agent_pb.ts`, and review all changed wire cases and field numbers.
   - Expected areas: `proto/agent.proto`, `proto/agent_pb.ts`, schema attribution files, `package.json`, `package-lock.json`, `README.md`.
   - Acceptance: field 36 and field 55 are typed, a second generation is byte-for-byte unchanged, and published package metadata retains the required attribution.
   - Verification: run `npm run proto:generate`, compare a second generation with the first, decode the synthetic field-36 fixture, and inspect `npm pack --dry-run` output.
 
-- [ ] T02: Implement MCP discovery and bounded protocol failure.
+- [x] T02: Implement MCP discovery and bounded protocol failure.
   - Depends on: T01.
   - Scope: add typed MCP state construction, explicit exec dispositions, sanitized unknown metadata, shared streaming and non-streaming terminal failure paths, independent control-exec watchdog ownership, and exact-once cleanup.
   - Expected areas: `proxy.ts` and focused helpers only if separation materially improves testability.
   - Acceptance: synthetic discovery reaches `mcpArgs`; known unsupported and unknown execs terminate once with stable errors; heartbeat traffic cannot extend an unanswered control exec; existing Pi tool continuation remains unchanged.
   - Verification: focused Vitest cases in `proto.test.ts`, `index.test.ts`, and `security.test.ts` using fake bridges, fake timers, and synthetic protobuf bytes.
 
-- [ ] T03: Make protocol drift diagnosable and document maintenance.
+- [x] T03: Make protocol drift diagnosable and document maintenance.
   - Depends on: T01 and T02.
   - Scope: add sanitized lifecycle events and timeline rendering, document schema regeneration, attribution, failure behavior, and the watchdog's relationship to the existing stall timeout.
   - Expected areas: `scripts/debug-log-timeline.mjs`, `scripts.test.ts`, `README.md`, schema provenance documentation.
   - Acceptance: a synthetic debug log highlights decoded cases, response disposition, unknown field numbers, watchdog or protocol termination, and `stream.stall_timeout` without raw payloads or secrets.
   - Verification: focused script tests plus manual review of text and JSON timeline output.
 
-- [ ] T04: Run medium-assurance regression and packaging verification.
+- [x] T04: Run medium-assurance regression and packaging verification.
   - Depends on: T01 through T03.
   - Scope: focused and full offline checks, package smoke, dry-run packaging, and optional approved live smoke.
   - Expected areas: verification evidence only, plus narrow fixes required by failed in-scope checks.
@@ -201,8 +201,8 @@ Record live verification as skipped, passed, or failed. Do not imply model-wide 
 ## Progress
 
 - [x] Planning complete and confirmed.
-- [ ] Implementation not started.
-- [ ] Verification not run.
+- [x] Implementation complete.
+- [x] Verification complete; mandatory offline checks and medium-assurance reviews passed.
 
 ## Execution handoff
 

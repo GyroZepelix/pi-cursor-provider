@@ -38,10 +38,13 @@
     "proxy.ts",
     "h2-bridge.mjs",
     "cursor-models-raw.json",
+    "proto/agent.proto",
     "proto/agent_pb.ts",
+    "proto/ATTRIBUTION.md",
     "README.md",
     "CHANGELOG.md",
     "scripts/debug-log-timeline.mjs",
+    "scripts/generate-proto.mjs",
     "scripts/refresh-models.mjs",
     "scripts/smoke-live.mjs",
     "LICENSE"
@@ -63,12 +66,14 @@
     "prepack": "npm run check 1>&2",
     "prepublishOnly": "npm run check",
     "refresh-models": "node scripts/refresh-models.mjs",
-    "debug:timeline": "node scripts/debug-log-timeline.mjs"
+    "debug:timeline": "node scripts/debug-log-timeline.mjs",
+    "proto:generate": "node scripts/generate-proto.mjs"
   },
   "publishConfig": {
     "access": "public"
   },
   "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.10.2",
     "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "typescript": "^6.0.3",

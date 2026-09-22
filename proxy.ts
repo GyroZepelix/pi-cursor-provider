@@ -61,6 +61,9 @@ import {
   McpArgsSchema,
   McpErrorSchema,
   McpResultSchema,
+  McpStateExecResultSchema,
+  McpStateServerSchema,
+  McpStateSuccessSchema,
   McpSuccessSchema,
   McpTextContentSchema,
   McpToolCallSchema,
@@ -161,6 +164,41 @@ interface PendingExec {
   toolCallId: string;
   toolName: string;
   decodedArgs: string;
+}
+
+interface UnknownFieldSummary {
+  fieldNumber: number;
+  wireType: number;
+  byteLength: number;
+}
+
+interface ExecLifecycle {
+  onReceipt(
+    execMsg: ExecServerMessage,
+    execCase: ExecServerMessage["message"]["case"],
+    unknownFields: UnknownFieldSummary[],
+  ): void;
+  onResponse(execMsg: ExecServerMessage, responseCase: string): void;
+  onDelegation(execMsg: ExecServerMessage): void;
+}
+
+class CursorProtocolFailure extends Error {
+  readonly code: "cursor_protocol_error" | "cursor_protocol_timeout";
+  readonly execCase?: string;
+  readonly unknownFields: UnknownFieldSummary[];
+
+  constructor(
+    code: "cursor_protocol_error" | "cursor_protocol_timeout",
+    message: string,
+    execCase?: string,
+    unknownFields: UnknownFieldSummary[] = [],
+  ) {
+    super(message);
+    this.name = "CursorProtocolFailure";
+    this.code = code;
+    this.execCase = execCase;
+    this.unknownFields = unknownFields;
+  }
 }
 
 interface StderrData {
@@ -384,6 +422,9 @@ export const __testInternals = {
   activeBridges,
   sessionBridges,
   conversationStates,
+  createControlExecLifecycle,
+  buildMcpStateResult,
+  summarizeUnknownFields,
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
@@ -401,6 +442,7 @@ const PROXY_BODY_TIMEOUT_MS = 30_000;
 const bridgeHeartbeats = new Map<BridgeHandle, ReturnType<typeof setInterval>>();
 const bridgeKillTimers = new Map<BridgeHandle, ReturnType<typeof setTimeout>>();
 const disposedBridges = new WeakSet<BridgeHandle>();
+const killedBridges = new WeakSet<BridgeHandle>();
 
 // ── Bridge spawn ──
 
@@ -1039,10 +1081,15 @@ export function cleanupAllSessionState(): void {
   sessionBridges.clear();
   conversationStates.clear();
   for (const bridge of bridges) {
+    const cleanupAlreadyStarted = disposedBridges.has(bridge);
     disposedBridges.add(bridge);
-    if (bridge.alive) {
+    if (!bridge.alive) continue;
+    if (!cleanupAlreadyStarted) {
       try { sendCancelAction(bridge); } catch {}
       try { bridge.end(); } catch {}
+    }
+    if (bridge.alive && !killedBridges.has(bridge)) {
+      killedBridges.add(bridge);
       try { bridge.proc.kill(); } catch {}
     }
   }
@@ -1973,9 +2020,20 @@ function processServerMessage(
   onText: (text: string, isThinking?: boolean) => void,
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
+  execLifecycle?: ExecLifecycle,
 ): void {
   const msgCase = msg.message.case;
-  debugLog("server_message", { msgCase, msg });
+  if (msgCase === "execServerMessage") {
+    const execMsg = msg.message.value as ExecServerMessage;
+    debugLog("server_message", {
+      msgCase,
+      execId: execMsg.execId,
+      execMessageId: execMsg.id,
+      execCase: execMsg.message.case,
+    });
+  } else {
+    debugLog("server_message", { msgCase, msg });
+  }
 
   if (msgCase === "interactionUpdate") {
     const update = msg.message.value as any;
@@ -1997,6 +2055,7 @@ function processServerMessage(
       mcpTools,
       sendFrame,
       onMcpExec,
+      execLifecycle,
     );
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
@@ -2055,13 +2114,80 @@ function handleKvMessage(
   }
 }
 
+function summarizeUnknownFields(execMsg: ExecServerMessage): UnknownFieldSummary[] {
+  return (execMsg.$unknown ?? []).map((field) => ({
+    fieldNumber: field.no,
+    wireType: field.wireType,
+    byteLength: field.data.byteLength,
+  }));
+}
+
+function buildMcpStateResult(
+  mcpTools: McpToolDefinition[],
+  serverIdentifiers: readonly string[],
+) {
+  const groupedTools = new Map<string, McpToolDefinition[]>();
+  for (const tool of mcpTools) {
+    const identifier = tool.providerIdentifier;
+    if (!identifier.trim()) continue;
+    const existing = groupedTools.get(identifier);
+    if (existing) existing.push(tool);
+    else groupedTools.set(identifier, [tool]);
+  }
+  const requested = serverIdentifiers.length > 0
+    ? new Set(serverIdentifiers)
+    : undefined;
+  const servers = Array.from(groupedTools, ([identifier, tools]) =>
+    create(McpStateServerSchema, {
+      serverName: identifier,
+      serverIdentifier: identifier,
+      tools,
+      instructions: [],
+      status: "connected",
+    }))
+    .filter((server) => !requested || requested.has(server.serverIdentifier));
+  return create(McpStateExecResultSchema, {
+    result: {
+      case: "success",
+      value: create(McpStateSuccessSchema, { servers }),
+    },
+  });
+}
+
 function handleExecMessage(
   execMsg: ExecServerMessage,
   mcpTools: McpToolDefinition[],
   sendFrame: (data: Uint8Array) => void,
   onMcpExec: (exec: PendingExec) => void,
+  lifecycle?: ExecLifecycle,
 ): void {
-  const execCase = (execMsg as any).message.case;
+  const execCase = execMsg.message.case;
+  const unknownFields = summarizeUnknownFields(execMsg);
+  lifecycle?.onReceipt(execMsg, execCase, unknownFields);
+
+  const respond = (messageCase: string, value: unknown): void => {
+    try {
+      sendExecResult(execMsg, messageCase, value, sendFrame);
+    } catch {
+      throw new CursorProtocolFailure(
+        "cursor_protocol_error",
+        "Cursor protocol response could not be written.",
+        execCase,
+        unknownFields,
+      );
+    }
+    lifecycle?.onResponse(execMsg, messageCase);
+  };
+
+  if (execCase === undefined) {
+    throw new CursorProtocolFailure(
+      "cursor_protocol_error",
+      "Cursor sent an unsupported protocol message.",
+      undefined,
+      unknownFields,
+    );
+  }
+
   const REJECT_REASON =
     "Tool not available in this environment. Use the MCP tools provided instead.";
 
@@ -2082,239 +2208,181 @@ function handleExecMessage(
         value: create(RequestContextSuccessSchema, { requestContext }),
       },
     });
-    sendExecResult(execMsg, "requestContextResult", result, sendFrame);
+    respond("requestContextResult", result);
+    return;
+  }
+
+  if (execCase === "mcpStateExecArgs") {
+    const args = execMsg.message.value;
+    respond("mcpStateExecResult", buildMcpStateResult(
+      mcpTools,
+      args.serverIdentifiers,
+    ));
     return;
   }
 
   if (execCase === "mcpArgs") {
-    const mcpArgs = (execMsg as any).message.value;
-    const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
-    onMcpExec({
-      execId: (execMsg as any).execId,
-      execMsgId: (execMsg as any).id,
-      toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
-      toolName: mcpArgs.toolName || mcpArgs.name,
-      decodedArgs: JSON.stringify(decoded),
-    });
+    const mcpArgs = execMsg.message.value;
+    try {
+      const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+      onMcpExec({
+        execId: execMsg.execId,
+        execMsgId: execMsg.id,
+        toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
+        toolName: mcpArgs.toolName || mcpArgs.name,
+        decodedArgs: JSON.stringify(decoded),
+      });
+    } catch {
+      throw new CursorProtocolFailure(
+        "cursor_protocol_error",
+        "Cursor tool delegation could not be completed.",
+        execCase,
+      );
+    }
+    lifecycle?.onDelegation(execMsg);
     return;
   }
 
-  // Reject native Cursor tools so model falls back to MCP tools
+  // Reject native Cursor tools so model falls back to MCP tools.
   if (execCase === "readArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "readResult",
-      create(ReadResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ReadRejectedSchema, {
-            path: args.path,
-            reason: REJECT_REASON,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("readResult", create(ReadResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ReadRejectedSchema, {
+          path: args.path,
+          reason: REJECT_REASON,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "lsArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "lsResult",
-      create(LsResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(LsRejectedSchema, {
-            path: args.path,
-            reason: REJECT_REASON,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("lsResult", create(LsResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(LsRejectedSchema, {
+          path: args.path,
+          reason: REJECT_REASON,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "grepArgs") {
-    sendExecResult(
-      execMsg,
-      "grepResult",
-      create(GrepResultSchema, {
-        result: {
-          case: "error",
-          value: create(GrepErrorSchema, { error: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
+    respond("grepResult", create(GrepResultSchema, {
+      result: {
+        case: "error",
+        value: create(GrepErrorSchema, { error: REJECT_REASON }),
+      },
+    }));
     return;
   }
   if (execCase === "writeArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "writeResult",
-      create(WriteResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(WriteRejectedSchema, {
-            path: args.path,
-            reason: REJECT_REASON,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("writeResult", create(WriteResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(WriteRejectedSchema, {
+          path: args.path,
+          reason: REJECT_REASON,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "deleteArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "deleteResult",
-      create(DeleteResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(DeleteRejectedSchema, {
-            path: args.path,
-            reason: REJECT_REASON,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("deleteResult", create(DeleteResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(DeleteRejectedSchema, {
+          path: args.path,
+          reason: REJECT_REASON,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "shellArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "shellResult",
-      create(ShellResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ShellRejectedSchema, {
-            command: args.command ?? "",
-            workingDirectory: args.workingDirectory ?? "",
-            reason: REJECT_REASON,
-            isReadonly: false,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("shellResult", create(ShellResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ShellRejectedSchema, {
+          command: args.command ?? "",
+          workingDirectory: args.workingDirectory ?? "",
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "shellStreamArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "shellStream",
-      create(ShellStreamSchema, {
-        event: {
-          case: "rejected",
-          value: create(ShellRejectedSchema, {
-            command: args.command ?? "",
-            workingDirectory: args.workingDirectory ?? "",
-            reason: REJECT_REASON,
-            isReadonly: false,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("shellStream", create(ShellStreamSchema, {
+      event: {
+        case: "rejected",
+        value: create(ShellRejectedSchema, {
+          command: args.command ?? "",
+          workingDirectory: args.workingDirectory ?? "",
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "backgroundShellSpawnArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "backgroundShellSpawnResult",
-      create(BackgroundShellSpawnResultSchema, {
-        result: {
-          case: "rejected",
-          value: create(ShellRejectedSchema, {
-            command: args.command ?? "",
-            workingDirectory: args.workingDirectory ?? "",
-            reason: REJECT_REASON,
-            isReadonly: false,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("backgroundShellSpawnResult", create(BackgroundShellSpawnResultSchema, {
+      result: {
+        case: "rejected",
+        value: create(ShellRejectedSchema, {
+          command: args.command ?? "",
+          workingDirectory: args.workingDirectory ?? "",
+          reason: REJECT_REASON,
+          isReadonly: false,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "writeShellStdinArgs") {
-    sendExecResult(
-      execMsg,
-      "writeShellStdinResult",
-      create(WriteShellStdinResultSchema, {
-        result: {
-          case: "error",
-          value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }),
-        },
-      }),
-      sendFrame,
-    );
+    respond("writeShellStdinResult", create(WriteShellStdinResultSchema, {
+      result: {
+        case: "error",
+        value: create(WriteShellStdinErrorSchema, { error: REJECT_REASON }),
+      },
+    }));
     return;
   }
   if (execCase === "fetchArgs") {
-    const args = (execMsg as any).message.value;
-    sendExecResult(
-      execMsg,
-      "fetchResult",
-      create(FetchResultSchema, {
-        result: {
-          case: "error",
-          value: create(FetchErrorSchema, {
-            url: args.url ?? "",
-            error: REJECT_REASON,
-          }),
-        },
-      }),
-      sendFrame,
-    );
+    const args = execMsg.message.value;
+    respond("fetchResult", create(FetchResultSchema, {
+      result: {
+        case: "error",
+        value: create(FetchErrorSchema, {
+          url: args.url ?? "",
+          error: REJECT_REASON,
+        }),
+      },
+    }));
     return;
   }
   if (execCase === "diagnosticsArgs") {
-    sendExecResult(
-      execMsg,
-      "diagnosticsResult",
-      create(DiagnosticsResultSchema, {}),
-      sendFrame,
-    );
+    respond("diagnosticsResult", create(DiagnosticsResultSchema, {}));
     return;
   }
 
-  // Unknown exec types
-  const miscCaseMap: Record<string, string> = {
-    listMcpResourcesExecArgs: "listMcpResourcesExecResult",
-    readMcpResourceExecArgs: "readMcpResourceExecResult",
-    recordScreenArgs: "recordScreenResult",
-    computerUseArgs: "computerUseResult",
-  };
-  const resultCase = miscCaseMap[execCase as string];
-  if (resultCase) {
-    sendExecResult(execMsg, resultCase, create(McpResultSchema, {}), sendFrame);
-    return;
-  }
-
-  // Catch-all: log and attempt a generic rejection so the bridge doesn't hang
-  console.error(
-    `[cursor-provider] UNHANDLED exec case: "${execCase}". Bridge may stall.`,
+  throw new CursorProtocolFailure(
+    "cursor_protocol_error",
+    "Cursor sent an unsupported protocol message.",
+    execCase,
+    unknownFields,
   );
-  // Try to derive the result case name from the args case name
-  const guessedResult = (execCase as string)?.replace(/Args$/, "Result");
-  if (guessedResult && guessedResult !== execCase) {
-    sendExecResult(
-      execMsg,
-      guessedResult,
-      create(McpResultSchema, {}),
-      sendFrame,
-    );
-  }
 }
 
 function sendExecResult(
@@ -2401,12 +2469,15 @@ export function cleanupSessionState(sessionId?: string): void {
     hadConversation: conversationStates.has(convKey),
   });
   if (running) {
-    disposedBridges.add(running);
     const heartbeat = active?.heartbeatTimer ?? bridgeHeartbeats.get(running);
     if (heartbeat) cleanupBridge(running, heartbeat, bridgeKey);
-    else {
+    else if (!disposedBridges.has(running)) {
+      disposedBridges.add(running);
       try { running.end(); } catch {}
-      try { running.proc.kill(); } catch {}
+      if (running.alive && !killedBridges.has(running)) {
+        killedBridges.add(running);
+        try { running.proc.kill(); } catch {}
+      }
       sessionBridges.delete(bridgeKey);
     }
   }
@@ -2653,7 +2724,11 @@ function startBridge(accessToken: string, requestBytes: Uint8Array, bridgeKey: s
         `[cursor-provider] Stale bridge detected for session ${bridgeKey} — force-killing and replacing`,
       );
       staleBridgeKilled = true;
-      try { existing.proc.kill(); } catch {}
+      disposedBridges.add(existing);
+      if (!killedBridges.has(existing)) {
+        killedBridges.add(existing);
+        try { existing.proc.kill(); } catch {}
+      }
     }
     sessionBridges.delete(bridgeKey);
   }
@@ -2729,6 +2804,8 @@ function cleanupBridge(
   heartbeatTimer: ReturnType<typeof setInterval>,
   bridgeKey: string,
 ): void {
+  if (disposedBridges.has(bridge)) return;
+  disposedBridges.add(bridge);
   debugLog("bridge.cleanup", { bridgeKey, alive: bridge.alive });
   clearInterval(heartbeatTimer);
   bridgeHeartbeats.delete(bridge);
@@ -2738,6 +2815,8 @@ function cleanupBridge(
     if (bridge.alive && !bridgeKillTimers.has(bridge)) {
       const timer = setTimeout(() => {
         bridgeKillTimers.delete(bridge);
+        if (killedBridges.has(bridge)) return;
+        killedBridges.add(bridge);
         try { bridge.proc.kill(); } catch {}
       }, 10_000);
       timer.unref();
@@ -2750,6 +2829,101 @@ function cleanupBridge(
 
 const MAX_BRIDGE_RETRIES =
   parseInt(process.env.PI_CURSOR_MAX_BRIDGE_RETRIES ?? "") || 2;
+
+function controlExecTimeoutMs(): number {
+  return parseInt(process.env.PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS ?? "") || 120_000;
+}
+
+function execMessageIdentity(execMsg: ExecServerMessage): string {
+  return `${execMsg.id}:${execMsg.execId}`;
+}
+
+function createControlExecLifecycle(options: {
+  requestId?: string;
+  bridgeKey: string;
+  timeoutMs?: number;
+  onExpire: (failure: CursorProtocolFailure) => void;
+}): ExecLifecycle & { clearAll(): void; pendingCount(): number } {
+  const pending = new Map<string, ReturnType<typeof setTimeout>>();
+  const timeoutMs = options.timeoutMs ?? controlExecTimeoutMs();
+  const clear = (execMsg: ExecServerMessage): void => {
+    const identity = execMessageIdentity(execMsg);
+    const timer = pending.get(identity);
+    if (timer) clearTimeout(timer);
+    pending.delete(identity);
+  };
+
+  return {
+    onReceipt(execMsg, execCase, unknownFields) {
+      const identity = execMessageIdentity(execMsg);
+      debugLog("exec.received", {
+        requestId: options.requestId,
+        bridgeKey: options.bridgeKey,
+        execMessageId: execMsg.id,
+        execId: execMsg.execId,
+        execCase,
+      });
+      if (unknownFields.length > 0) {
+        debugLog("exec.unknown_fields", {
+          requestId: options.requestId,
+          bridgeKey: options.bridgeKey,
+          execMessageId: execMsg.id,
+          execId: execMsg.execId,
+          unknownFields,
+        });
+      }
+      const previous = pending.get(identity);
+      if (previous) clearTimeout(previous);
+      const timer = setTimeout(() => {
+        pending.delete(identity);
+        debugLog("exec.watchdog_expired", {
+          requestId: options.requestId,
+          bridgeKey: options.bridgeKey,
+          execMessageId: execMsg.id,
+          execId: execMsg.execId,
+          execCase,
+          timeoutMs,
+        });
+        options.onExpire(new CursorProtocolFailure(
+          "cursor_protocol_timeout",
+          "Cursor protocol response timed out.",
+          execCase,
+          unknownFields,
+        ));
+      }, timeoutMs);
+      timer.unref?.();
+      pending.set(identity, timer);
+    },
+    onResponse(execMsg, responseCase) {
+      clear(execMsg);
+      debugLog("exec.response", {
+        requestId: options.requestId,
+        bridgeKey: options.bridgeKey,
+        execMessageId: execMsg.id,
+        execId: execMsg.execId,
+        execCase: execMsg.message.case,
+        responseCase,
+      });
+    },
+    onDelegation(execMsg) {
+      clear(execMsg);
+      debugLog("exec.delegated", {
+        requestId: options.requestId,
+        bridgeKey: options.bridgeKey,
+        execMessageId: execMsg.id,
+        execId: execMsg.execId,
+        execCase: execMsg.message.case,
+      });
+    },
+    clearAll() {
+      for (const timer of pending.values()) clearTimeout(timer);
+      pending.clear();
+    },
+    pendingCount() {
+      return pending.size;
+    },
+  };
+}
 
 function writeSSEStream(
   initialBridge: BridgeHandle,
@@ -2809,6 +2983,9 @@ function writeSSEStream(
   }
 
   let closed = false;
+  let protocolTerminated = false;
+  let controlExecLifecycle: ReturnType<typeof createControlExecLifecycle> | undefined;
+  const STALL_TIMEOUT_MS = controlExecTimeoutMs();
   let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
   const sendSSE = (data: object) => {
     if (closed) return;
@@ -2823,6 +3000,7 @@ function writeSSEStream(
     closed = true;
     clearInterval(keepAliveTimer);
     if (stallTimer) clearTimeout(stallTimer);
+    controlExecLifecycle?.clearAll();
     res.end();
   };
 
@@ -2874,7 +3052,6 @@ function writeSSEStream(
   // long.  This catches cases where the H2 connection is technically alive
   // but Cursor's server is stuck processing a stale conversation checkpoint.
   // Reset on every incoming Connect frame.
-  const STALL_TIMEOUT_MS = parseInt(process.env.PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS ?? "") || 120_000;
   let stallTimer: ReturnType<typeof setTimeout> | undefined;
   const resetStallTimer = () => {
     if (stallTimer) clearTimeout(stallTimer);
@@ -2891,7 +3068,7 @@ function writeSSEStream(
 
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
-    if (cancelled || closed) return;
+    if (cancelled || closed || protocolTerminated) return;
     debugLog("stream.client_close", { requestId, bridgeKey, convKey });
     cancelled = true;
     cleanupBridge(activeBridge, activeHeartbeatTimer, bridgeKey);
@@ -2899,6 +3076,48 @@ function writeSSEStream(
   };
   req.on("close", onClientClose);
   res.on("close", onClientClose);
+
+  const terminateProtocolFailure = (failure: CursorProtocolFailure): void => {
+    if (protocolTerminated || closed || cancelled) return;
+    protocolTerminated = true;
+    retryableConnectError = false;
+    controlExecLifecycle?.clearAll();
+    req.removeListener("close", onClientClose);
+    res.removeListener("close", onClientClose);
+    const stored = conversationStates.get(convKey);
+    if (stored) {
+      stored.checkpoint = preTurnCheckpoint
+        ? new Uint8Array(preTurnCheckpoint)
+        : null;
+    }
+    debugLog("exec.protocol_failure", {
+      requestId,
+      bridgeKey,
+      convKey,
+      code: failure.code,
+      execCase: failure.execCase,
+      unknownFields: failure.unknownFields,
+      checkpointRestored: true,
+    });
+    console.error(`[cursor-provider] Cursor protocol failure (${failure.code}).`);
+    sendSSE({
+      error: {
+        message: failure.message,
+        type: "upstream_error",
+        code: failure.code,
+      },
+    });
+    sendDone();
+    closeResponse();
+    cleanupBridge(activeBridge, activeHeartbeatTimer, bridgeKey);
+  };
+
+  controlExecLifecycle = createControlExecLifecycle({
+    requestId,
+    bridgeKey,
+    timeoutMs: STALL_TIMEOUT_MS,
+    onExpire: terminateProtocolFailure,
+  });
 
   // Wire data/close handlers onto the current activeBridge.  Called once on
   // initial setup and again on each transparent retry.
@@ -2912,7 +3131,7 @@ function writeSSEStream(
 
     const processChunk = createConnectFrameParser(
       (messageBytes) => {
-        if (disposedBridges.has(activeBridge)) return;
+        if (disposedBridges.has(activeBridge) || protocolTerminated) return;
         resetStallTimer();
         try {
           const serverMessage = fromBinary(
@@ -3019,8 +3238,13 @@ function writeSSEStream(
                 checkpointBytes,
               });
             },
+            controlExecLifecycle,
           );
         } catch (err) {
+          if (err instanceof CursorProtocolFailure) {
+            terminateProtocolFailure(err);
+            return;
+          }
           console.error(
             "[cursor-provider] Stream message processing error:",
             err instanceof Error ? err.message : err,
@@ -3028,7 +3252,7 @@ function writeSSEStream(
         }
       },
       (endStreamBytes) => {
-        if (disposedBridges.has(activeBridge)) return;
+        if (disposedBridges.has(activeBridge) || protocolTerminated) return;
         resetStallTimer();
         const endError = parseConnectEndStream(endStreamBytes);
         clearInterval(activeHeartbeatTimer);
@@ -3093,7 +3317,14 @@ function writeSSEStream(
       clearTimeout(bridgeKillTimers.get(activeBridge));
       bridgeKillTimers.delete(activeBridge);
       if (stallTimer) clearTimeout(stallTimer);
+      controlExecLifecycle?.clearAll();
       if (sessionBridges.get(bridgeKey) === activeBridge) sessionBridges.delete(bridgeKey);
+      if (protocolTerminated) {
+        req.removeListener("close", onClientClose);
+        res.removeListener("close", onClientClose);
+        closeResponse();
+        return;
+      }
       if (disposedBridges.has(activeBridge)) {
         req.removeListener("close", onClientClose);
         res.removeListener("close", onClientClose);
@@ -3145,6 +3376,7 @@ function writeSSEStream(
           );
 
           // Reset per-attempt stream state; keep cumulative token counts.
+          controlExecLifecycle?.clearAll();
           state.pendingExecs = [];
           latestCheckpoint = null;
 
@@ -3397,17 +3629,24 @@ async function handleNonStreamingResponse(
   const completionId = `chatcmpl-${crypto.randomUUID().replace(/-/g, "").slice(0, 28)}`;
   const created = Math.floor(Date.now() / 1000);
 
+  const preTurnCheckpoint = (() => {
+    const stored = conversationStates.get(convKey);
+    return stored?.checkpoint ? new Uint8Array(stored.checkpoint) : null;
+  })();
   const { bridge, heartbeatTimer } = startBridge(
     accessToken,
     payload.requestBytes,
     bridgeKey,
   );
   let cancelled = false;
+  let protocolTerminated = false;
+  let controlExecLifecycle: ReturnType<typeof createControlExecLifecycle> | undefined;
 
   const onClientClose = () => {
-    if (cancelled) return;
+    if (cancelled || protocolTerminated) return;
     debugLog("nonstream.client_close", { requestId, convKey });
     cancelled = true;
+    controlExecLifecycle?.clearAll();
     clearInterval(heartbeatTimer);
     if (bridge.alive) {
       sendCancelAction(bridge);
@@ -3431,10 +3670,54 @@ async function handleNonStreamingResponse(
   let latestCheckpoint: Uint8Array | null = null;
 
   return new Promise((resolve) => {
+    const terminateProtocolFailure = (failure: CursorProtocolFailure): void => {
+      if (protocolTerminated || cancelled) return;
+      protocolTerminated = true;
+      controlExecLifecycle?.clearAll();
+      req.removeListener("close", onClientClose);
+      res.removeListener("close", onClientClose);
+      const stored = conversationStates.get(convKey);
+      if (stored) {
+        stored.checkpoint = preTurnCheckpoint
+          ? new Uint8Array(preTurnCheckpoint)
+          : null;
+      }
+      debugLog("exec.protocol_failure", {
+        requestId,
+        bridgeKey,
+        convKey,
+        code: failure.code,
+        execCase: failure.execCase,
+        unknownFields: failure.unknownFields,
+        checkpointRestored: true,
+      });
+      console.error(`[cursor-provider] Cursor protocol failure (${failure.code}).`);
+      if (!res.writableEnded && !res.destroyed) {
+        if (!res.headersSent) {
+          res.writeHead(502, { "Content-Type": "application/json" });
+        }
+        res.end(JSON.stringify({
+          error: {
+            message: failure.message,
+            type: "upstream_error",
+            code: failure.code,
+          },
+        }));
+      }
+      cleanupBridge(bridge, heartbeatTimer, bridgeKey);
+      resolve();
+    };
+
+    controlExecLifecycle = createControlExecLifecycle({
+      requestId,
+      bridgeKey,
+      onExpire: terminateProtocolFailure,
+    });
+
     bridge.onData(
       createConnectFrameParser(
         (messageBytes) => {
-          if (disposedBridges.has(bridge)) return;
+          if (disposedBridges.has(bridge) || protocolTerminated) return;
           try {
             const serverMessage = fromBinary(
               AgentServerMessageSchema,
@@ -3499,8 +3782,13 @@ async function handleNonStreamingResponse(
                   checkpointBytes,
                 });
               },
+              controlExecLifecycle,
             );
           } catch (err) {
+            if (err instanceof CursorProtocolFailure) {
+              terminateProtocolFailure(err);
+              return;
+            }
             console.error(
               "[cursor-provider] Non-stream message processing error:",
               err instanceof Error ? err.message : err,
@@ -3508,7 +3796,7 @@ async function handleNonStreamingResponse(
           }
         },
         (endStreamBytes) => {
-          if (disposedBridges.has(bridge)) return;
+          if (disposedBridges.has(bridge) || protocolTerminated) return;
           const endError = parseConnectEndStream(endStreamBytes);
           // Always unref regardless of error/success.
           clearInterval(heartbeatTimer);
@@ -3537,12 +3825,17 @@ async function handleNonStreamingResponse(
         latestCheckpoint,
       });
       clearInterval(heartbeatTimer);
+      controlExecLifecycle?.clearAll();
       bridgeHeartbeats.delete(bridge);
       clearTimeout(bridgeKillTimers.get(bridge));
       bridgeKillTimers.delete(bridge);
       if (sessionBridges.get(bridgeKey) === bridge) sessionBridges.delete(bridgeKey);
       req.removeListener("close", onClientClose);
       res.removeListener("close", onClientClose);
+      if (protocolTerminated) {
+        resolve();
+        return;
+      }
       if (disposedBridges.has(bridge)) {
         if (!res.writableEnded && !res.destroyed) res.end();
         resolve();

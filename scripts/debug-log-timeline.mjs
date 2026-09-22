@@ -19,6 +19,13 @@ const NOTABLE_EVENTS = [
   "nonstream.checkpoint_committed",
   "stream.bridge_close",
   "nonstream.bridge_close",
+  "stream.stall_timeout",
+  "exec.received",
+  "exec.response",
+  "exec.delegated",
+  "exec.unknown_fields",
+  "exec.watchdog_expired",
+  "exec.protocol_failure",
   "session.cleanup",
   "session.cleanup_all",
   "conversation.evict",
@@ -110,6 +117,13 @@ function formatTool(exec) {
   return `${name}:${shortId(id)}`;
 }
 
+function formatUnknownFields(fields) {
+  if (!Array.isArray(fields)) return "";
+  return fields.map((field) =>
+    `${field.fieldNumber ?? "?"}/w${field.wireType ?? "?"}/${field.byteLength ?? "?"}b`,
+  ).join(",");
+}
+
 function parseLogFile(filePath) {
   const content = readFileSync(filePath, "utf8");
   const lines = content.split(/\r?\n/);
@@ -168,6 +182,9 @@ function summarize(events, filePath) {
         bridgeClose: undefined,
         error: undefined,
         noUserMessage: false,
+        execEvents: [],
+        protocolFailure: undefined,
+        stallTimeout: false,
       };
       requests.set(requestId, request);
       requestOrder.push(requestId);
@@ -298,6 +315,42 @@ function summarize(events, filePath) {
           nonStreamError: event.nonStreamError ?? undefined,
         };
         break;
+      case "stream.stall_timeout":
+        if (!req) break;
+        req.stallTimeout = true;
+        break;
+      case "exec.received":
+        if (!req) break;
+        req.execEvents.push(`received:${event.execCase ?? "unknown"}:${shortId(event.execId ?? event.execMessageId)}`);
+        break;
+      case "exec.response":
+        if (!req) break;
+        req.execEvents.push(`response:${event.responseCase ?? "unknown"}:${shortId(event.execId ?? event.execMessageId)}`);
+        break;
+      case "exec.delegated":
+        if (!req) break;
+        req.execEvents.push(`delegated:${event.execCase ?? "unknown"}:${shortId(event.execId ?? event.execMessageId)}`);
+        break;
+      case "exec.unknown_fields":
+        if (!req) break;
+        req.execEvents.push(`unknown:[${formatUnknownFields(event.unknownFields)}]`);
+        break;
+      case "exec.watchdog_expired":
+        if (!req) break;
+        req.execEvents.push(`watchdog:${event.execCase ?? "unknown"}:${shortId(event.execId ?? event.execMessageId)}`);
+        break;
+      case "exec.protocol_failure":
+        if (!req) break;
+        req.protocolFailure = {
+          code: event.code ?? "cursor_protocol_error",
+          execCase: event.execCase ?? undefined,
+          unknownFields: Array.isArray(event.unknownFields) ? event.unknownFields.map((field) => ({
+            fieldNumber: field.fieldNumber,
+            wireType: field.wireType,
+            byteLength: field.byteLength,
+          })) : [],
+        };
+        break;
       case "stream.checkpoint_committed":
       case "nonstream.checkpoint_committed":
         if (!req) break;
@@ -352,6 +405,12 @@ function renderRequestLine(request, baseTsMs) {
   if (request.discardCheckpoint) pieces.push(`discardCheckpoint=${request.discardCheckpoint}`);
   if (request.noUserMessage) pieces.push("NO_USER_MESSAGE");
   if (request.error) pieces.push(`error=${JSON.stringify(request.error)}`);
+  if (request.execEvents.length > 0) pieces.push(`exec=[${request.execEvents.join(", ")}]`);
+  if (request.protocolFailure) {
+    const fields = formatUnknownFields(request.protocolFailure.unknownFields);
+    pieces.push(`PROTOCOL_FAILURE(code=${request.protocolFailure.code}${request.protocolFailure.execCase ? `, case=${request.protocolFailure.execCase}` : ""}${fields ? `, fields=[${fields}]` : ""})`);
+  }
+  if (request.stallTimeout) pieces.push("STALL_TIMEOUT");
 
   if (request.resumeToolResults.length > 0 || typeof request.pendingBeforeResume === "number") {
     const ids = request.resumeToolResults

@@ -16,11 +16,12 @@
 ## Coverage expectations by change
 
 - Model parsing, effort maps, context inference, catalog routing: `index.test.ts` and `models.test.ts`.
-- Proxy requests, message reconstruction, tools, checkpoints, SSE, and session handling: `index.test.ts`.
+- Protobuf field/case compatibility, synthetic unknown fields, and MCP state grouping/filtering: `proto.test.ts`.
+- Proxy requests, message reconstruction, MCP discovery, tools, checkpoints, SSE, terminal protocol errors, and session handling: `index.test.ts`.
 - Authentication lifecycle and provider registration: `extension.test.ts`.
 - Ingress hardening, replay rules, shutdown, bridge failures, and log safety: `security.test.ts`.
 - Cursor error decoding and Pi-facing propagation: `errors.test.ts`.
 - HTTP/2 keepalive transport: `bridge.test.ts`.
-- Snapshot refresh normalization: `scripts.test.ts`.
+- Snapshot refresh normalization and sanitized debug-timeline summaries: `scripts.test.ts`.
 
 Live smoke testing is separate, explicit opt-in, and must use only synthetic prompts (`scripts/smoke-live.mjs`).

@@ -2,13 +2,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import type { ChildProcess, spawn } from "node:child_process";
 import { request, type IncomingMessage, type OutgoingHttpHeaders, type ServerResponse } from "node:http";
-import { create, toBinary } from "@bufbuild/protobuf";
+import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
+import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
   AgentServerMessageSchema,
   ConversationStateStructureSchema,
   ExecServerMessageSchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
+  ListMcpResourcesExecArgsSchema,
   McpArgsSchema,
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
@@ -433,10 +435,116 @@ function streamHarness() {
   return { sessionId, bridgeKey, convKey, bridge, retries, state, req, res, output, heartbeatTimer, currentTurn };
 }
 
+describe("control exec watchdog", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  test("expires by message identity, clears only on response, and excludes delegated mcpArgs", async () => {
+    const onExpire = vi.fn();
+    const lifecycle = __testInternals.createControlExecLifecycle({
+      bridgeKey: "watchdog-bridge",
+      timeoutMs: 100,
+      onExpire,
+    });
+    const unsupported = create(ExecServerMessageSchema, {
+      id: 1,
+      execId: "control",
+      message: {
+        case: "listMcpResourcesExecArgs",
+        value: create(ListMcpResourcesExecArgsSchema, {}),
+      },
+    });
+
+    lifecycle.onReceipt(unsupported, unsupported.message.case, []);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(onExpire).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(onExpire).toHaveBeenCalledTimes(1);
+    expect(onExpire.mock.calls[0]?.[0]).toMatchObject({
+      code: "cursor_protocol_timeout",
+      execCase: "listMcpResourcesExecArgs",
+    });
+
+    lifecycle.onReceipt(unsupported, unsupported.message.case, []);
+    lifecycle.onResponse(unsupported, "listMcpResourcesExecResult");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(onExpire).toHaveBeenCalledTimes(1);
+
+    const delegated = create(ExecServerMessageSchema, {
+      id: 2,
+      execId: "delegated",
+      message: {
+        case: "mcpArgs",
+        value: create(McpArgsSchema, { toolCallId: "tc", toolName: "read" }),
+      },
+    });
+    lifecycle.onReceipt(delegated, delegated.message.case, []);
+    lifecycle.onDelegation(delegated);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(onExpire).toHaveBeenCalledTimes(1);
+    expect(lifecycle.pendingCount()).toBe(0);
+    lifecycle.clearAll();
+  });
+});
+
 describe("shutdown stream lifecycle", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  test("unknown exec termination logs only sanitized metadata and cleans up once", () => {
+    temp = mkdtempSync(join(tmpdir(), "cursor-protocol-log-"));
+    const path = join(temp, "protocol.log");
+    vi.stubEnv("PI_CURSOR_PROVIDER_DEBUG", "1");
+    vi.stubEnv("PI_CURSOR_PROVIDER_DEBUG_FILE", path);
+    const h = streamHarness();
+    const secret = "private-tool-arguments";
+    const execBytes = new BinaryWriter()
+      .tag(1, WireType.Varint)
+      .uint32(77)
+      .tag(15, WireType.LengthDelimited)
+      .string("future")
+      .tag(60, WireType.LengthDelimited)
+      .bytes(new TextEncoder().encode(secret))
+      .finish();
+    const agentBytes = new BinaryWriter()
+      .tag(2, WireType.LengthDelimited)
+      .bytes(execBytes)
+      .finish();
+
+    h.bridge.emit(fromBinary(AgentServerMessageSchema, agentBytes));
+    h.bridge.emit(create(AgentServerMessageSchema, { message: {
+      case: "execServerMessage",
+      value: create(ExecServerMessageSchema, {
+        id: 78,
+        execId: "late",
+        message: {
+          case: "mcpArgs",
+          value: create(McpArgsSchema, { toolCallId: "late-tool", toolName: "read" }),
+        },
+      }),
+    } }));
+    h.bridge.emitClose(0);
+
+    const output = h.output.join("");
+    expect(output.match(/cursor_protocol_error/g)).toHaveLength(1);
+    expect(output.match(/\[DONE\]/g)).toHaveLength(1);
+    expect(output).not.toContain("late-tool");
+    expect(h.res.end).toHaveBeenCalledTimes(1);
+    expect(h.req.listenerCount("close")).toBe(0);
+    expect(h.res.listenerCount("close")).toBe(0);
+    expect(__testInternals.activeBridges.has(h.bridgeKey)).toBe(false);
+    expect(__testInternals.sessionBridges.has(h.bridgeKey)).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
+
+    const log = readFileSync(path, "utf8");
+    expect(log).toContain('"event":"exec.unknown_fields"');
+    expect(log).toContain('"fieldNumber":60');
+    expect(log).toContain('"wireType":2');
+    expect(log).toContain('"byteLength":23');
+    expect(log).not.toContain(secret);
   });
 
   test("shutdown terminates an active stream and clears timers and listeners", () => {

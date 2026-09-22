@@ -5,10 +5,10 @@ kind: work-item
 work_type: bug
 parent: null
 route: quick-plan
-status: planned
+status: completed
 superseded_by: null
 created_at: '2026-09-22T21:26:47+02:00'
-updated_at: '2026-09-22T21:26:47+02:00'
+updated_at: '2026-09-22T22:54:55+02:00'
 external_refs:
 - system: github
   type: commit

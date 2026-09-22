@@ -26,3 +26,11 @@ Use this shape for new entries:
 - Wiki pages changed: `wiki/overview.md`, `wiki/map.md`, `wiki/architecture.md`, `wiki/development.md`, `wiki/conventions/index.md`, `wiki/conventions/typescript-and-modules.md`, `wiki/conventions/testing.md`, `wiki/conventions/security-and-state.md`, `wiki/index.md`, `wiki/log.md`, and `wiki/state.md`.
 - Verification: navigation, convention routing, relative links, cited paths, ASCII content, fences, whitespace, suspected secrets, checkpoint stability, and outside-wiki status passed; `git diff --check -- wiki` passed.
 - Notes: complete at the analysis commit. Type-check is Unverified because project dependencies were absent. Tests, builds, packaging, generators, smoke tests, application commands, and external access were not run.
+
+## [2026-09-22] focused-ingest | Cursor MCP protocol maintenance
+
+- Trigger: the field-36 MCP discovery repair established durable protocol, generation, failure, and testing behavior.
+- Inputs: `wiki/raw/cursor-mcp-tool-discovery-freeze-handoff.md`; spec item `260922-2126-fix-cursor-mcp-tool-discovery-protocol-freeze`; `proto/agent.proto`; `proto/ATTRIBUTION.md`; `proxy.ts`; focused synthetic tests.
+- Wiki pages changed: `wiki/architecture.md`, `wiki/development.md`, `wiki/conventions/testing.md`, `wiki/conventions/security-and-state.md`, `wiki/index.md`, `wiki/log.md`, and `wiki/state.md`.
+- Verification: schema regeneration and focused protocol, proxy, lifecycle, and timeline tests passed during implementation; final whole-repository evidence is recorded separately in the active spec.
+- Notes: source and runtime behavior remain pinned to the reviewed schema commit. Live Cursor verification was not authorized and is not represented as deterministic coverage.

@@ -17,7 +17,8 @@ Pi loads `index.ts` as a source extension. The extension owns provider registrat
 2. `proxy.ts` authenticates the request before reading its body or resolving the Cursor credential. It rejects browser origins, unexpected hosts, unsupported encoding/media types, malformed shapes, timeouts, and bodies over 32 MiB.
 3. OpenAI messages, images, tools, and effort settings are normalized. `model-ids.ts` resolves the selected canonical model to an exact discovered Cursor ID.
 4. `buildCursorRequest` serializes protobuf messages and content-addressed blobs. If no server checkpoint exists it reconstructs recent turns; older turns can be folded into an inline summary archive.
-5. `h2-bridge.mjs` sends Connect/protobuf frames over HTTP/2. `proxy.ts` handles Cursor blob and tool messages and maps text, reasoning, tool calls, usage, and errors back to OpenAI-compatible JSON or SSE (`proxy.ts`, `proto/agent_pb.ts`).
+5. `h2-bridge.mjs` sends Connect/protobuf frames over HTTP/2. `proxy.ts` handles Cursor blob and exec messages and maps text, reasoning, tool calls, usage, and errors back to OpenAI-compatible JSON or SSE (`proxy.ts`, `proto/agent_pb.ts`).
+6. Cursor's field-36 MCP state request is answered locally from the same `mcpTools` catalog advertised in request context. Tools are grouped in stable order by non-empty provider identifier, optionally filtered by requested server identifiers, and reported as connected. Only a subsequent `mcpArgs` transfers to Pi's tool continuation path (`proxy.ts`, `proto.test.ts`, `index.test.ts`).
 
 ## State and ownership
 
@@ -30,7 +31,8 @@ Pi loads `index.ts` as a source extension. The extension owns provider registrat
 
 - The proxy binds only to loopback, uses a random 256-bit bearer, and does not expose upstream credentials as local credentials (`proxy.ts`, `security.test.ts`).
 - Retries occur only before content has reached the client, preventing replayed partial output. The pre-turn checkpoint is retained for a clean retry (`proxy.ts`, `security.test.ts`).
-- Bridge heartbeat, HTTP/2 PING, activity timeout, and stream stall handling bound dead or stuck connections (`proxy.ts`, `h2-bridge.mjs`, `bridge.test.ts`).
+- Bridge heartbeat, HTTP/2 PING, activity timeout, and stream stall handling bound dead or stuck connections. A separate per-message control-exec watchdog uses the stall-timeout budget but is not reset by Cursor heartbeats; delegated `mcpArgs` execution is excluded (`proxy.ts`, `h2-bridge.mjs`, `bridge.test.ts`, `security.test.ts`).
+- Exec dispatch is fail-closed: each supported control exec receives its schema-matched response, `mcpArgs` delegates to Pi, and decoded-but-unsupported or unknown cases terminate without transparent retry. Streaming termination is one SSE error plus `[DONE]`; non-streaming termination is one 502 JSON error (`proxy.ts`, `index.test.ts`).
 - Checkpoints and blobs are retained across transient failures and client disconnects when available, but shutdown rejects late callbacks (`proxy.ts`, `security.test.ts`).
 - Debug logging is opt-in. Binary data and credentials are summarized or redacted, and file writes require a private owned regular file (`proxy.ts`, `index.ts`, `secure-log.ts`).
 
