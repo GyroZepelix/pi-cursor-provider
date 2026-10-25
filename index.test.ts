@@ -1,5 +1,5 @@
 import rawModels from "./cursor-models-raw.json" with { type: "json" };
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest } from "node:http";
 import {
@@ -42,9 +42,15 @@ import {
   ConversationStateStructureSchema,
   ConversationTurnStructureSchema,
   ConversationStepSchema,
+  ExecServerAbortSchema,
+  ExecServerControlMessageSchema,
   ExecServerMessageSchema,
   type ExecServerMessage,
+  HeartbeatUpdateSchema,
+  InteractionQuerySchema,
+  type InteractionQuery,
   InteractionUpdateSchema,
+  ReadArgsSchema,
   KvServerMessageSchema,
   ListMcpResourcesExecArgsSchema,
   McpArgsSchema,
@@ -60,6 +66,7 @@ afterEach(() => {
   stopProxy();
   setBridgeFactoryForTests();
   cleanupAllSessionState();
+  vi.unstubAllEnvs();
 });
 
 // ── Helper ──
@@ -2481,25 +2488,113 @@ describe("proxy integration — session handling", () => {
   });
 });
 
+function execControlMessages(bridge: FakeBridge): any[] {
+  return bridge.clientMessages
+    .filter((message) => message.message.case === "execClientControlMessage")
+    .map((message) => message.message.value.message);
+}
+
+/** Exec-related client frames as compact `kind:case:id` labels in write order. */
+function execReplyTrace(bridge: FakeBridge): string[] {
+  const trace: string[] = [];
+  for (const message of bridge.clientMessages) {
+    if (message.message.case === "execClientMessage") {
+      const exec = message.message.value;
+      trace.push(`result:${exec.message.case}:${exec.id}`);
+    } else if (message.message.case === "execClientControlMessage") {
+      const control = message.message.value.message;
+      trace.push(`control:${control.case}:${control.value.id}`);
+    }
+  }
+  return trace;
+}
+
+function makeInteractionQueryMessage(id: number, queryCase: string) {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionQuery",
+      value: create(InteractionQuerySchema, {
+        id,
+        query: { case: queryCase as any, value: {} as any },
+      }),
+    },
+  });
+}
+
+function makeUnknownInteractionQueryMessage(id: number) {
+  const queryBytes = new BinaryWriter()
+    .tag(1, WireType.Varint)
+    .uint32(id)
+    .tag(99, WireType.LengthDelimited)
+    .bytes(new TextEncoder().encode("private-future-query"))
+    .finish();
+  const agentBytes = new BinaryWriter()
+    .tag(7, WireType.LengthDelimited)
+    .bytes(queryBytes)
+    .finish();
+  return fromBinary(AgentServerMessageSchema, agentBytes);
+}
+
+function makeAbortMessage(id: number) {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "execServerControlMessage",
+      value: create(ExecServerControlMessageSchema, {
+        message: { case: "abort", value: create(ExecServerAbortSchema, { id }) },
+      }),
+    },
+  });
+}
+
+function makeHeartbeatMessage() {
+  return create(AgentServerMessageSchema, {
+    message: {
+      case: "interactionUpdate",
+      value: create(InteractionUpdateSchema, {
+        message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) },
+      }),
+    },
+  });
+}
+
 describe("proxy hang fixes", () => {
   test.each([
     { stream: true, kind: "unknown" as const },
     { stream: false, kind: "unknown" as const },
     { stream: true, kind: "decoded" as const },
     { stream: false, kind: "decoded" as const },
-  ])("$kind exec fails terminally exactly once when stream=$stream", async ({ stream, kind }) => {
+    { stream: true, kind: "undecodable" as const },
+    { stream: false, kind: "undecodable" as const },
+  ])("$kind exec receives one in-band throw and the turn continues when stream=$stream", async ({ stream, kind }) => {
+    // Replaces the former fail-closed termination: Cursor's executor answers
+    // unanswerable execs with throw + stream_close and the turn proceeds.
     const bridges: FakeBridge[] = [];
+    const execId = kind === "unknown" ? 91 : kind === "decoded" ? 92 : 93;
     setBridgeFactoryForTests((options) => {
       const bridge = new FakeBridge(options, (clientMessage, fake) => {
-        if (clientMessage.message.case !== "runRequest") return;
-        // A protocol-failed partial turn must not replace the pre-turn checkpoint.
-        fake.emitServerMessage(makeCheckpointMessage());
-        fake.emitServerMessage(kind === "unknown"
-          ? makeUnknownExecMessage()
-          : makeExecMessage(92, "decoded-unsupported", {
-              case: "listMcpResourcesExecArgs",
-              value: create(ListMcpResourcesExecArgsSchema, {}),
-            }));
+        if (clientMessage.message.case === "runRequest") {
+          fake.emitServerMessage(kind === "unknown"
+            ? makeUnknownExecMessage()
+            : kind === "decoded"
+              ? makeExecMessage(92, "decoded-unsupported", {
+                  case: "listMcpResourcesExecArgs",
+                  value: create(ListMcpResourcesExecArgsSchema, {}),
+                })
+              : makeExecMessage(93, "undecodable", {
+                  case: "mcpArgs",
+                  value: create(McpArgsSchema, {
+                    name: "read", toolName: "read", toolCallId: "tc-undecodable",
+                    args: { path: new Uint8Array([0xff, 0xff]) },
+                  }),
+                }));
+          return;
+        }
+        if (clientMessage.message.case === "execClientControlMessage" &&
+          clientMessage.message.value.message.case === "streamClose") {
+          fake.emitServerMessage(makeTextDeltaMessage("recovered in band"));
+          fake.emitServerMessage(makeCheckpointMessage());
+          fake.close(0);
+        }
       });
       bridges.push(bridge);
       return bridge;
@@ -2526,18 +2621,317 @@ describe("proxy hang fixes", () => {
     });
 
     expect(bridges).toHaveLength(1);
-    expect(response.statusCode).toBe(stream ? 200 : 502);
-    expect(response.body.match(/cursor_protocol_error/g)).toHaveLength(1);
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("recovered in band");
+    expect(response.body).not.toContain("cursor_protocol_error");
     expect(response.body).not.toContain("private-future-payload");
-    expect(response.body.match(/\[DONE\]/g) ?? []).toHaveLength(stream ? 1 : 0);
+    expect(response.body).not.toContain("tc-undecodable");
+    expect(response.body).not.toContain("tool_calls");
+    expect(execReplyTrace(bridges[0]!)).toEqual([
+      `control:throw:${execId}`,
+      `control:streamClose:${execId}`,
+    ]);
+    const thrown = execControlMessages(bridges[0]!)[0];
+    expect(thrown.value.error).toMatch(/^(Unsupported Cursor exec|Tool arguments could not be decoded)/);
+    expect(thrown.value.error).not.toContain("private");
     expect(bridges[0]!.clientMessages.filter(
       (message) => message.message.case === "conversationAction",
-    )).toHaveLength(1);
+    )).toHaveLength(0);
     expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
     expect(__testInternals.sessionBridges.has(bridgeKey)).toBe(false);
-    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toEqual(
+    expect(__testInternals.conversationStates.get(convKey)?.checkpoint).not.toEqual(
       priorCheckpoint,
     );
+  });
+
+  test.each([
+    { queryCase: "webSearchRequestQuery", responseCase: "webSearchRequestResponse", resultCase: "approved" },
+    { queryCase: "webFetchRequestQuery", responseCase: "webFetchRequestResponse", resultCase: "approved" },
+    { queryCase: "exaSearchRequestQuery", responseCase: "exaSearchRequestResponse", resultCase: "approved" },
+    { queryCase: "exaFetchRequestQuery", responseCase: "exaFetchRequestResponse", resultCase: "approved" },
+    { queryCase: "askQuestionInteractionQuery", responseCase: "askQuestionInteractionResponse", resultCase: "rejected" },
+    { queryCase: "switchModeRequestQuery", responseCase: "switchModeRequestResponse", resultCase: "rejected" },
+    { queryCase: "createPlanRequestQuery", responseCase: "createPlanRequestResponse", resultCase: "error" },
+    { queryCase: "setupVmEnvironmentArgs", responseCase: undefined, resultCase: undefined },
+    { queryCase: "unknown", responseCase: undefined, resultCase: undefined },
+  ])("interaction query $queryCase receives $responseCase/$resultCase", async ({ queryCase, responseCase, resultCase }) => {
+    const bridges: FakeBridge[] = [];
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case !== "runRequest") return;
+        fake.emitServerMessage(queryCase === "unknown"
+          ? makeUnknownInteractionQueryMessage(41)
+          : makeInteractionQueryMessage(41, queryCase));
+        setTimeout(() => {
+          fake.emitServerMessage(makeTextDeltaMessage("query handled"));
+          fake.close(0);
+        }, 0);
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      messages: [{ role: "user", content: "synthetic" }],
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain("query handled");
+    const responses = bridges[0]!.clientMessages
+      .filter((message) => message.message.case === "interactionResponse")
+      .map((message) => message.message.value);
+    if (!responseCase) {
+      expect(responses).toHaveLength(0);
+      return;
+    }
+    expect(responses).toHaveLength(1);
+    expect(responses[0].id).toBe(41);
+    expect(responses[0].result.case).toBe(responseCase);
+    const value = responses[0].result.value;
+    const typed = "result" in value && value.result && "result" in value.result
+      ? value.result.result // AskQuestion/CreatePlan wrap a nested result message.
+      : value.result;
+    expect(typed.case).toBe(resultCase);
+    if (resultCase !== "approved") {
+      const text = typed.value.reason ?? typed.value.error;
+      expect(text).toContain("not supported by this client");
+    }
+  });
+
+  test("abort of a delegated exec suppresses only its result on resume", async () => {
+    const bridges: FakeBridge[] = [];
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case === "runRequest") {
+          fake.emitServerMessage(makeExecMessage(1, "exec-a", {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, { name: "read", toolName: "read", toolCallId: "tc-a" }),
+          }));
+          fake.emitServerMessage(makeExecMessage(2, "exec-b", {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, { name: "read", toolName: "read", toolCallId: "tc-b" }),
+          }));
+          // Cursor aborts exec 1 while Pi is running the tools.
+          fake.emitServerMessage(makeAbortMessage(1));
+          return;
+        }
+        if (clientMessage.message.case === "execClientControlMessage") {
+          setTimeout(() => {
+            fake.emitServerMessage(makeTextDeltaMessage("after abort"));
+            fake.emitServerMessage(makeCheckpointMessage());
+            fake.close(0);
+          }, 0);
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+    const sessionId = "session-abort";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const port = await startProxy(async () => "test-token");
+    const first = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "read two files" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+    });
+    expect(first.body).toContain('"finish_reason":"tool_calls"');
+    const pending = __testInternals.activeBridges.get(bridgeKey)?.pendingExecs;
+    expect(pending?.map((exec) => [exec.toolCallId, exec.aborted ?? false])).toEqual([
+      ["tc-a", true],
+      ["tc-b", false],
+    ]);
+
+    const second = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "read two files" },
+        { role: "assistant", content: null, tool_calls: [
+          { id: "tc-a", type: "function", function: { name: "read", arguments: "{}" } },
+          { id: "tc-b", type: "function", function: { name: "read", arguments: "{}" } },
+        ] },
+        { role: "tool", content: "a", tool_call_id: "tc-a" },
+        { role: "tool", content: "b", tool_call_id: "tc-b" },
+      ],
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.body).toContain("after abort");
+    expect(execReplyTrace(bridges[0]!)).toEqual([
+      "result:mcpResult:2",
+      "control:streamClose:2",
+    ]);
+  });
+
+  test.each([
+    { setting: undefined, enabled: true },
+    { setting: "0", enabled: false },
+    { setting: "false", enabled: false },
+    { setting: "1", enabled: true },
+  ])("stream_close follows every exec reply type when PI_CURSOR_EXEC_STREAM_CLOSE=$setting", async ({ setting, enabled }) => {
+    if (setting !== undefined) vi.stubEnv("PI_CURSOR_EXEC_STREAM_CLOSE", setting);
+    const bridges: FakeBridge[] = [];
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        const kind = clientMessage.message.case;
+        if (kind === "runRequest") {
+          fake.emitServerMessage(makeExecMessage(10, "context", {
+            case: "requestContextArgs",
+            value: create(RequestContextArgsSchema, {}),
+          }));
+          return;
+        }
+        const label = kind === "execClientMessage"
+          ? clientMessage.message.value.message.case
+          : kind === "execClientControlMessage" ? clientMessage.message.value.message.case : undefined;
+        // Advance on the reply itself; stream_close (when sent) is written synchronously after it.
+        if (label === "requestContextResult") {
+          queueMicrotask(() => fake.emitServerMessage(makeExecMessage(11, "native", {
+            case: "readArgs",
+            value: create(ReadArgsSchema, { path: "synthetic" }),
+          })));
+        } else if (label === "readResult") {
+          queueMicrotask(() => fake.emitServerMessage(makeExecMessage(12, "unsupported", {
+            case: "listMcpResourcesExecArgs",
+            value: create(ListMcpResourcesExecArgsSchema, {}),
+          })));
+        } else if (label === "throw") {
+          queueMicrotask(() => fake.emitServerMessage(makeExecMessage(13, "state", {
+            case: "mcpStateExecArgs",
+            value: create(McpStateExecArgsSchema, { serverIdentifiers: ["pi"] }),
+          })));
+        } else if (label === "mcpStateExecResult") {
+          queueMicrotask(() => fake.emitServerMessage(makeExecMessage(14, "delegated", {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, { name: "read", toolName: "read", toolCallId: "tc-close" }),
+          })));
+        } else if (label === "mcpResult") {
+          setTimeout(() => {
+            fake.emitServerMessage(makeTextDeltaMessage("all replies closed"));
+            fake.emitServerMessage(makeCheckpointMessage());
+            fake.close(0);
+          }, 0);
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+    const sessionId = `session-stream-close-${setting}`;
+    const port = await startProxy(async () => "test-token");
+    const first = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [{ role: "user", content: "synthetic" }],
+      tools: [{ type: "function", function: { name: "read" } }],
+    });
+    expect(first.body).toContain('"id":"tc-close"');
+    const second = await postChatCompletion(port, {
+      model: "gpt-5",
+      pi_session_id: sessionId,
+      messages: [
+        { role: "user", content: "synthetic" },
+        { role: "assistant", content: null, tool_calls: [
+          { id: "tc-close", type: "function", function: { name: "read", arguments: "{}" } },
+        ] },
+        { role: "tool", content: "synthetic result", tool_call_id: "tc-close" },
+      ],
+    });
+    expect(second.body).toContain("all replies closed");
+    const replies = [
+      "result:requestContextResult:10",
+      "result:readResult:11",
+      "control:throw:12",
+      "result:mcpStateExecResult:13",
+      "result:mcpResult:14",
+    ];
+    expect(execReplyTrace(bridges[0]!)).toEqual(replies.flatMap((reply) => {
+      const id = reply.split(":").at(-1);
+      return enabled ? [reply, `control:streamClose:${id}`] : [reply];
+    }));
+  });
+
+  test("non-streaming exec rejection is followed by stream_close", async () => {
+    const bridges: FakeBridge[] = [];
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case === "runRequest") {
+          fake.emitServerMessage(makeExecMessage(5, "nonstream", {
+            case: "mcpArgs",
+            value: create(McpArgsSchema, { name: "read", toolName: "read", toolCallId: "tc-ns" }),
+          }));
+        } else if (clientMessage.message.case === "execClientControlMessage") {
+          fake.emitServerMessage(makeTextDeltaMessage("done"));
+          fake.close(0);
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+    const port = await startProxy(async () => "test-token");
+    const response = await postChatCompletion(port, {
+      model: "gpt-5",
+      stream: false,
+      messages: [{ role: "user", content: "synthetic" }],
+    });
+    expect(response.statusCode).toBe(200);
+    expect(execReplyTrace(bridges[0]!)).toEqual(["result:mcpResult:5", "control:streamClose:5"]);
+  });
+
+  test("heartbeat-only wait after a tool-result resume ends in one retryable stall error", async () => {
+    vi.stubEnv("PI_CURSOR_PROGRESS_TIMEOUT_MS", "150");
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    const bridges: FakeBridge[] = [];
+    setBridgeFactoryForTests((options) => {
+      const bridge = new FakeBridge(options, (clientMessage, fake) => {
+        if (clientMessage.message.case === "runRequest") {
+          fake.emitServerMessage(makeMcpExecMessage("tc-stall", "read", { path: "x" }));
+        } else if (clientMessage.message.case === "execClientMessage") {
+          // Cursor keeps heartbeating but never makes progress.
+          heartbeat = setInterval(() => fake.emitServerMessage(makeHeartbeatMessage()), 20);
+        }
+      });
+      bridges.push(bridge);
+      return bridge;
+    });
+    const sessionId = "session-resume-stall";
+    const bridgeKey = deriveBridgeKeyFromSessionId(sessionId);
+    const convKey = deriveConversationKeyFromSessionId(sessionId);
+    const port = await startProxy(async () => "test-token");
+    try {
+      await postChatCompletion(port, {
+        model: "gpt-5",
+        pi_session_id: sessionId,
+        messages: [{ role: "user", content: "synthetic" }],
+        tools: [{ type: "function", function: { name: "read" } }],
+      });
+      const checkpointBefore = __testInternals.conversationStates.get(convKey)?.checkpoint;
+      const resumed = await postChatCompletion(port, {
+        model: "gpt-5",
+        pi_session_id: sessionId,
+        messages: [
+          { role: "user", content: "synthetic" },
+          { role: "assistant", content: null, tool_calls: [
+            { id: "tc-stall", type: "function", function: { name: "read", arguments: '{"path":"x"}' } },
+          ] },
+          { role: "tool", content: "synthetic", tool_call_id: "tc-stall" },
+        ],
+      });
+      expect(resumed.statusCode).toBe(200);
+      expect(resumed.body.match(/cursor_stall_timeout/g)).toHaveLength(1);
+      expect(resumed.body).toContain("Cursor stream timeout: no progress for 150ms");
+      expect(resumed.body.match(/\[DONE\]/g)).toHaveLength(1);
+      expect(bridges).toHaveLength(1); // No proxy-internal replay.
+      expect(bridges[0]!.clientMessages.filter(
+        (message) => message.message.case === "conversationAction",
+      )).toHaveLength(1);
+      expect(__testInternals.activeBridges.has(bridgeKey)).toBe(false);
+      expect(__testInternals.sessionBridges.has(bridgeKey)).toBe(false);
+      expect(__testInternals.conversationStates.get(convKey)?.checkpoint).toBe(checkpointBefore);
+    } finally {
+      clearInterval(heartbeat);
+    }
   });
 
   test("non-streaming: exec requests are rejected immediately so the bridge closes and the response resolves", async () => {

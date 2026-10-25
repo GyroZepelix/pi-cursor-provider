@@ -4,7 +4,7 @@
 
 - **Image support** — base64 `image_url` content parts forwarded to Cursor end-to-end; the upstream silently drops them
 * **Compaction support:** old turns archived as inline text to reduce blob retrieval work; bridge termination errors surface as failures instead of silent empty responses; server checkpoints preserved across Pi compaction
-- **Reliability** — transparent retry for transient Cursor protocol errors (internal / unavailable / deadline_exceeded); HTTP/2 PING keepalive detects dead connections; stall timer kills stuck bridges; bridge timeouts hardened and configurable; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
+- **Reliability** — transparent retry for transient Cursor protocol errors (internal / unavailable / deadline_exceeded); HTTP/2 PING keepalive detects dead connections; wire-idle and semantic-progress watchdogs end stuck turns with one Pi-retryable error; bridge timeouts hardened and configurable; SSE keepalive prevents pi from timing out during blob-fetching; conversation state and checkpoints survive transient failures and client disconnects
 - **Model support** — per-model context window inference (vs. hardcoded 200 k); runtime cap scaling when Cursor enforces a tighter window; detailed cost table for all current families; effort-suffix variants deduplicated so pi's reasoning-level setting drives the suffix automatically
 - **Thinking-tag filtering** — inline `<think>` / `<reasoning>` tags stripped from the response and routed to `reasoning_content`
 - **Fixes & observability** — `pi -p` exit hang fixed; dead TTL eviction code removed; opt-in JSONL debug logging with a bundled timeline viewer
@@ -79,7 +79,9 @@ This is not a sandbox against code already running as your user. Extensions have
 | `PI_CURSOR_BRIDGE_ACTIVITY_TIMEOUT_MS` | `300000` | Kill bridge if no HTTP/2 activity for this many ms after the first frame |
 | `PI_CURSOR_BRIDGE_PING_INTERVAL_MS` | `15000` | HTTP/2 PING interval to detect dead connections |
 | `PI_CURSOR_BRIDGE_PING_TIMEOUT_MS` | `10000` | Timeout for each HTTP/2 PING before declaring the connection dead |
-| `PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS` | `120000` | Bound both wire-idle detection and an unanswered control-exec watchdog; delegated `mcpArgs` tool execution is excluded from the control watchdog |
+| `PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS` | `120000` | Bound both wire-idle detection (any Cursor frame, including heartbeats, resets it) and an unanswered control-exec watchdog; delegated `mcpArgs` tool execution is excluded from the control watchdog. A wire-idle stall ends the turn with a retryable `cursor_stall_timeout` error |
+| `PI_CURSOR_PROGRESS_TIMEOUT_MS` | `180000` | End a streaming turn with a retryable `cursor_stall_timeout` error when Cursor makes no semantic progress (text, reasoning, tokens, tool calls, steps, checkpoints, KV or exec traffic) for this many ms. Heartbeats do not count. `0` disables; empty, negative, or non-numeric values use the default |
+| `PI_CURSOR_EXEC_STREAM_CLOSE` | on | After every exec reply, send Cursor's `stream_close` completion marker for that exec. Set to `0` or `false` to disable |
 | `PI_CURSOR_MAX_BRIDGE_RETRIES` | `2` | Max transparent retries on transient Cursor errors or bridge crashes |
 | `PI_CURSOR_TURN_ARCHIVE_THRESHOLD` | `20` | Keep this many recent turns as raw blobs; older turns are archived as inline text |
 | `PI_CURSOR_RAW_MODELS` | off | Set to disable model deduplication and see all raw Cursor model IDs |
@@ -188,7 +190,17 @@ Previously these transient errors were surfaced as `finish_reason: "error"`, req
 
 The bridge now configures HTTP/2-level PINGs (`PI_CURSOR_BRIDGE_PING_INTERVAL_MS` / `PI_CURSOR_BRIDGE_PING_TIMEOUT_MS`) so dead TCP connections (NAT timeout, load-balancer cycling) are detected within seconds rather than waiting for the 5-minute activity timeout.
 
-Additionally, a stall timer (`PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS`, default 120 s) kills the bridge if no data arrives from Cursor — catching cases where the HTTP/2 connection is technically alive but the server is stuck processing a stale checkpoint.
+Additionally, a stall timer (`PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS`, default 120 s) ends the turn if no data arrives from Cursor — catching cases where the HTTP/2 connection is technically alive but the server is stuck processing a stale checkpoint.
+
+Cursor heartbeats keep the wire busy even when a turn has stopped moving, so streaming turns (fresh and after a tool-result resume) also have a semantic-progress watchdog (`PI_CURSOR_PROGRESS_TIMEOUT_MS`, default 180 s). Text, reasoning, token, tool-call, step, summary, checkpoint, KV, and answered exec or interaction frames count as progress; heartbeats, empty deltas, and unanswered or unknown frames do not. Continuous streamed reasoning never trips it.
+
+Either stall ends the turn with exactly one SSE error, followed by `[DONE]`:
+
+```json
+{ "error": { "message": "Cursor stream timeout: no progress for 180s", "type": "upstream_error", "code": "cursor_stall_timeout" } }
+```
+
+The message contains `timeout`, so Pi's automatic retry treats it as transient. The proxy does not replay the turn itself; the bridge is cancelled, the last good checkpoint is kept, and Pi's retry rebuilds the request from it.
 
 ### Usage reporting on tool-call continuations
 
@@ -323,7 +335,7 @@ Session state is cleared on Pi lifecycle events for session switch, fork, `/tree
 
 ### Error resilience
 
-Transient Cursor errors (`internal`, `unavailable`, `deadline_exceeded`) and bridge crashes are retried automatically — up to `PI_CURSOR_MAX_BRIDGE_RETRIES` times — without dropping the SSE connection to pi. The last good checkpoint survives all error types and is used on retry. If Cursor sends a checkpoint before a client disconnect, that checkpoint is also preserved.
+Transient Cursor errors (`internal`, `unavailable`, `deadline_exceeded`) and bridge crashes are retried automatically — up to `PI_CURSOR_MAX_BRIDGE_RETRIES` times — without dropping the SSE connection to pi. The last good checkpoint survives all error types and is used on retry. If Cursor sends a checkpoint before a client disconnect, that checkpoint is also preserved. A stalled stream (no data, or no semantic progress) ends with one retryable `cursor_stall_timeout` error instead of hanging, so Pi's automatic retry recovers it.
 
 ## Requirements
 
@@ -357,17 +369,40 @@ npm run proto:generate
 
 Never hand-edit `proto/agent_pb.ts`. Review the complete generated diff and run
 the command twice with a byte-for-byte comparison when updating the schema.
-The current runtime intentionally supports only an explicit exec allowlist:
-MCP state discovery is answered locally, `mcpArgs` is delegated to Pi, and
-unsupported decoded or future unknown exec cases terminate with a sanitized
-provider error rather than receiving a guessed response.
+Every Cursor frame that can be answered is answered in band so the run is
+never left waiting:
+
+- Request context and MCP state discovery are answered locally, native Cursor
+  tools are rejected so the model uses Pi's tools, and `mcpArgs` is delegated
+  to Pi.
+- An exec the proxy cannot answer or delegate (a decoded but unsupported case,
+  a future unknown case, or `mcpArgs` whose arguments are neither a protobuf
+  `Value` nor UTF-8 text) receives a short sanitized `ExecClientThrow`, and the
+  turn continues. Only a reply frame that cannot be written terminates the
+  turn with `cursor_protocol_error`.
+- Every exec reply is followed by `ExecClientControlMessage.stream_close` for
+  the same id unless `PI_CURSOR_EXEC_STREAM_CLOSE=0`.
+- `ExecServerControlMessage.abort` clears the control watchdog for that id. An
+  aborted delegated tool call's result is not written when Pi resumes; other
+  pending results are unaffected.
+- Interaction queries: hosted web search, web fetch, Exa search, and Exa fetch
+  are approved; ask-question and switch-mode are rejected and create-plan
+  returns an error, each pointing to Pi's tools. VM setup and unknown queries
+  are left unanswered (no truthful reply exists); the progress watchdog bounds
+  that wait.
 
 Live tests send only synthetic prompts and require explicit opt in plus existing Cursor authentication:
 
 ```bash
 npm run test:live -- --live cursor-grok-4.6 gpt-5.6-sol
 npm run test:live -- --live --tool cursor-grok-4.6
+npm run test:live -- --live --web-search cursor-grok-4.6
 ```
+
+`--web-search` sends a synthetic prompt likely to trigger Cursor's hosted web
+search and reports whether the run completed and whether an interaction query
+was observed. A run that elicits no query is reported as `not elicited`, not as
+a failure. `--tool` and `--web-search` are mutually exclusive.
 
 Packing and publishing run the offline checks automatically. Publishing additionally requires npm authentication. A packed archive is not published until an explicit `npm publish` command is run.
 
@@ -381,10 +416,14 @@ npm run debug:timeline -- /path/to/pi-cursor-provider-debug-2026-04-08T14-06-07-
 ```
 
 Add `--json` if you want the parsed summary as JSON instead of formatted text.
-The concise timeline elevates exec receipt, response or delegation, unknown
-field metadata, control-watchdog expiry, protocol termination, and stream stall
-timeouts. Unknown protocol diagnostics include only field number, wire type,
-and byte length; they never include the retained raw bytes.
+The concise timeline elevates exec receipt, response or delegation, in-band
+throw replies, `stream_close` writes, aborts, interaction query responses and
+unanswered queries, unknown field metadata, control-watchdog expiry, protocol
+termination, and `STALL_TIMEOUT` (wire idle) or `PROGRESS_TIMEOUT` (no semantic
+progress) with the limit, time since last progress, and per-stream frame-class
+counts. Unknown protocol diagnostics include only field number, wire type,
+and byte length; they never include the retained raw bytes. The new stall,
+query, throw, abort, and frame-count events are metadata only.
 
 ## Credits
 

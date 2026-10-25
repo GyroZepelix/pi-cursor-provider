@@ -5,9 +5,16 @@ import { request, type IncomingMessage, type OutgoingHttpHeaders, type ServerRes
 import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import {
+  AgentClientMessageSchema,
   AgentServerMessageSchema,
+  AskQuestionArgsSchema,
+  AskQuestionInteractionQuerySchema,
   ConversationStateStructureSchema,
+  ExecServerAbortSchema,
+  ExecServerControlMessageSchema,
   ExecServerMessageSchema,
+  HeartbeatUpdateSchema,
+  InteractionQuerySchema,
   InteractionUpdateSchema,
   KvServerMessageSchema,
   ListMcpResourcesExecArgsSchema,
@@ -15,6 +22,7 @@ import {
   SetBlobArgsSchema,
   TextDeltaUpdateSchema,
   ThinkingDeltaUpdateSchema,
+  TokenDeltaUpdateSchema,
   type AgentServerMessage,
 } from "./proto/agent_pb.ts";
 import { connect } from "node:net";
@@ -435,6 +443,234 @@ function streamHarness() {
   return { sessionId, bridgeKey, convKey, bridge, retries, state, req, res, output, heartbeatTimer, currentTurn };
 }
 
+function unknownExecMessage(id: number, secret: string): AgentServerMessage {
+  const execBytes = new BinaryWriter()
+    .tag(1, WireType.Varint)
+    .uint32(id)
+    .tag(15, WireType.LengthDelimited)
+    .string("future")
+    .tag(60, WireType.LengthDelimited)
+    .bytes(new TextEncoder().encode(secret))
+    .finish();
+  const agentBytes = new BinaryWriter()
+    .tag(2, WireType.LengthDelimited)
+    .bytes(execBytes)
+    .finish();
+  return fromBinary(AgentServerMessageSchema, agentBytes);
+}
+
+/** Decodes every Connect frame the proxy wrote to a controlled bridge. */
+function clientMessages(bridge: ControlledBridge) {
+  return bridge.write.mock.calls
+    .map(([frame]) => Buffer.from(frame as Uint8Array))
+    .filter((frame) => frame.length >= 5)
+    .map((frame) => fromBinary(AgentClientMessageSchema, frame.subarray(5, 5 + frame.readUInt32BE(1))));
+}
+
+function heartbeatMessage(): AgentServerMessage {
+  return create(AgentServerMessageSchema, { message: {
+    case: "interactionUpdate",
+    value: create(InteractionUpdateSchema, { message: { case: "heartbeat", value: create(HeartbeatUpdateSchema, {}) } }),
+  } });
+}
+
+function stallErrors(output: string[]): Array<{ message: string; type: string; code: string }> {
+  return output
+    .filter((chunk) => chunk.startsWith("data: {") && chunk.includes('"error"'))
+    .map((chunk) => JSON.parse(chunk.slice(6)).error);
+}
+
+describe("semantic progress watchdog", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  test("heartbeat-only wait ends in exactly one retryable stall error with exact-once cleanup", async () => {
+    const h = streamHarness();
+    for (let elapsed = 0; elapsed < 170_000; elapsed += 10_000) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      h.bridge.emit(heartbeatMessage());
+    }
+    expect(stallErrors(h.output)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const errors = stallErrors(h.output);
+    expect(errors).toEqual([{
+      message: "Cursor stream timeout: no progress for 180s",
+      type: "upstream_error",
+      code: "cursor_stall_timeout",
+    }]);
+    expect(h.output.at(-1)).toBe("data: [DONE]\n\n");
+    expect(h.res.end).toHaveBeenCalledTimes(1);
+    expect(h.req.listenerCount("close")).toBe(0);
+    expect(h.res.listenerCount("close")).toBe(0);
+    expect(__testInternals.sessionBridges.has(h.bridgeKey)).toBe(false);
+    expect(__testInternals.activeBridges.has(h.bridgeKey)).toBe(false);
+    const cancels = () => clientMessages(h.bridge).filter((m) => m.message.case === "conversationAction").length;
+    expect(cancels()).toBe(1);
+
+    // Late frames, a late close, and a client disconnect stay inert.
+    h.bridge.emit(deltaMessage("text", "late-visible"));
+    h.bridge.emit(checkpointMessage("late-checkpoint"));
+    h.req.emit("close");
+    h.bridge.emitClose(0);
+    await vi.advanceTimersByTimeAsync(400_000);
+    expect(h.output.join("")).not.toContain("late-visible");
+    expect(stallErrors(h.output)).toHaveLength(1);
+    expect(h.res.end).toHaveBeenCalledTimes(1);
+    expect(cancels()).toBe(1);
+    expect(h.retries).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.state.checkpoint).not.toBeNull(); // last good checkpoint kept
+  });
+
+  test("wire-idle stall emits the same explicit error instead of a bare close", async () => {
+    const h = streamHarness();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(stallErrors(h.output)).toEqual([{
+      message: "Cursor stream timeout: no data for 120s",
+      type: "upstream_error",
+      code: "cursor_stall_timeout",
+    }]);
+    expect(h.output.at(-1)).toBe("data: [DONE]\n\n");
+    expect(h.res.end).toHaveBeenCalledTimes(1);
+    h.bridge.emitClose(143);
+    expect(h.retries).toHaveLength(0);
+    expect(stallErrors(h.output)).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test.each(["reasoning", "tokens"] as const)("continuous %s progress beyond the window does not time out", async (kind) => {
+    const h = streamHarness();
+    for (let elapsed = 0; elapsed < 400_000; elapsed += 10_000) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      h.bridge.emit(kind === "reasoning" ? deltaMessage("reasoning", ".") : create(AgentServerMessageSchema, { message: {
+        case: "interactionUpdate",
+        value: create(InteractionUpdateSchema, { message: { case: "tokenDelta", value: create(TokenDeltaUpdateSchema, { tokens: 1 }) } }),
+      } }));
+    }
+    expect(stallErrors(h.output)).toHaveLength(0);
+    h.bridge.emit(deltaMessage("text", "final"));
+    h.bridge.emitClose(0);
+    expect(h.output.join("")).toContain('"finish_reason":"stop"');
+    expect(stallErrors(h.output)).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("a tool-paused (parked) writer runs no watchdog while Pi executes the tool", async () => {
+    const h = streamHarness();
+    h.bridge.emit(create(AgentServerMessageSchema, { message: {
+      case: "execServerMessage", value: create(ExecServerMessageSchema, { id: 1, execId: "parked", message: {
+        case: "mcpArgs", value: create(McpArgsSchema, { toolCallId: "tc-parked", name: "read", toolName: "read" }),
+      } }),
+    } }));
+    expect(h.output.join("")).toContain('"finish_reason":"tool_calls"');
+    for (let elapsed = 0; elapsed < 400_000; elapsed += 10_000) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      h.bridge.emit(heartbeatMessage());
+    }
+    expect(stallErrors(h.output)).toHaveLength(0);
+    expect(__testInternals.activeBridges.has(h.bridgeKey)).toBe(true);
+    expect(h.res.end).toHaveBeenCalledTimes(1);
+    stopProxy();
+    h.bridge.emitClose(143);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("a transparent retry re-arms the progress watchdog for the new bridge", async () => {
+    const h = streamHarness();
+    h.bridge.emitRetryableError();
+    h.bridge.emitClose(1);
+    expect(h.retries).toHaveLength(1);
+    for (let elapsed = 0; elapsed < 170_000; elapsed += 10_000) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      h.retries[0]!.emit(heartbeatMessage());
+    }
+    expect(stallErrors(h.output)).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(stallErrors(h.output)).toMatchObject([{ code: "cursor_stall_timeout" }]);
+    h.retries[0]!.emitClose(0);
+    expect(h.retries).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test("PI_CURSOR_PROGRESS_TIMEOUT_MS=0 disables the no-progress watchdog", async () => {
+    vi.stubEnv("PI_CURSOR_PROGRESS_TIMEOUT_MS", "0");
+    const h = streamHarness();
+    for (let elapsed = 0; elapsed < 400_000; elapsed += 10_000) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      h.bridge.emit(heartbeatMessage());
+    }
+    expect(stallErrors(h.output)).toHaveLength(0);
+    expect(h.res.end).not.toHaveBeenCalled();
+    stopProxy();
+    h.bridge.emitClose(143);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  test.each([
+    [undefined, 180_000], ["", 180_000], ["-5", 180_000], ["abc", 180_000], ["1.5", 180_000],
+    ["0", 0], [" 2500 ", 2500], ["99999999999", 2_147_483_647],
+  ])("PI_CURSOR_PROGRESS_TIMEOUT_MS=%j resolves to %d", (value, expected) => {
+    if (value !== undefined) vi.stubEnv("PI_CURSOR_PROGRESS_TIMEOUT_MS", value);
+    expect(__testInternals.progressTimeoutMs()).toBe(expected);
+  });
+
+  test("debug diagnostics record frame classes, queries, aborts, and the stall reason without payloads", async () => {
+    temp = mkdtempSync(join(tmpdir(), "cursor-stall-log-"));
+    const path = join(temp, "stall.log");
+    vi.stubEnv("PI_CURSOR_PROVIDER_DEBUG", "1");
+    vi.stubEnv("PI_CURSOR_PROVIDER_DEBUG_FILE", path);
+    const secret = "private-question-text";
+    const h = streamHarness();
+    h.bridge.emit(create(AgentServerMessageSchema, { message: {
+      case: "interactionQuery",
+      value: create(InteractionQuerySchema, { id: 3, query: {
+        case: "askQuestionInteractionQuery",
+        value: create(AskQuestionInteractionQuerySchema, {
+          toolCallId: secret,
+          args: create(AskQuestionArgsSchema, { title: secret }),
+        }),
+      } }),
+    } }));
+    h.bridge.emit(create(AgentServerMessageSchema, { message: {
+      case: "interactionQuery",
+      value: create(InteractionQuerySchema, { id: 4, query: { case: "setupVmEnvironmentArgs", value: {} as never } }),
+    } }));
+    h.bridge.emit(create(AgentServerMessageSchema, { message: {
+      case: "execServerControlMessage",
+      value: create(ExecServerControlMessageSchema, { message: { case: "abort", value: create(ExecServerAbortSchema, { id: 9 }) } }),
+    } }));
+    h.bridge.emit(unknownExecMessage(80, secret));
+    for (let elapsed = 0; elapsed < 180_000; elapsed += 10_000) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      h.bridge.emit(heartbeatMessage());
+    }
+    expect(stallErrors(h.output)).toHaveLength(1);
+
+    const lines = readFileSync(path, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const event = (name: string) => lines.filter((line) => line.event === name);
+    expect(event("interaction.response")).toMatchObject([{ queryId: 3, queryCase: "askQuestionInteractionQuery", responseCase: "askQuestionInteractionResponse" }]);
+    expect(event("interaction.unanswered")).toMatchObject([{ queryId: 4, queryCase: "setupVmEnvironmentArgs" }]);
+    expect(event("exec.abort")).toMatchObject([{ execMessageId: 9, clearedWatchdog: false, abortedDelegated: false }]);
+    expect(event("exec.throw")).toMatchObject([{ execMessageId: 80, reason: "unknown_case" }]);
+    expect(event("exec.stream_close")).toMatchObject([{ execMessageId: 80 }]);
+    const [timeout] = event("stream.progress_timeout");
+    expect(timeout).toMatchObject({ reason: "progress_timeout", limitMs: 180_000 });
+    expect(timeout.frameCounts).toMatchObject({
+      interactionQuery: 1,
+      "interactionQuery:unanswered": 1,
+      "execControl:abort": 1,
+      exec: 1,
+      "update:heartbeat": 17,
+    });
+    expect(typeof timeout.lastProgressAt).toBe("string");
+    expect(JSON.stringify(lines)).not.toContain(secret);
+    h.bridge.emitClose(0);
+  });
+});
+
 describe("control exec watchdog", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -484,6 +720,17 @@ describe("control exec watchdog", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(onExpire).toHaveBeenCalledTimes(1);
     expect(lifecycle.pendingCount()).toBe(0);
+
+    // A throw reply clears the watchdog like a typed result; abort clears by id.
+    lifecycle.onReceipt(unsupported, unsupported.message.case, []);
+    lifecycle.onResponse(unsupported, "throw");
+    expect(lifecycle.pendingCount()).toBe(0);
+    lifecycle.onReceipt(unsupported, unsupported.message.case, []);
+    expect(lifecycle.onAbort(2)).toBe(false);
+    expect(lifecycle.onAbort(1)).toBe(true);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(onExpire).toHaveBeenCalledTimes(1);
+    expect(lifecycle.pendingCount()).toBe(0);
     lifecycle.clearAll();
   });
 });
@@ -494,44 +741,26 @@ describe("shutdown stream lifecycle", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
   });
 
-  test("unknown exec termination logs only sanitized metadata and cleans up once", () => {
+  test("unknown exec gets a sanitized in-band throw, logs only metadata, and the turn continues", () => {
     temp = mkdtempSync(join(tmpdir(), "cursor-protocol-log-"));
     const path = join(temp, "protocol.log");
     vi.stubEnv("PI_CURSOR_PROVIDER_DEBUG", "1");
     vi.stubEnv("PI_CURSOR_PROVIDER_DEBUG_FILE", path);
     const h = streamHarness();
     const secret = "private-tool-arguments";
-    const execBytes = new BinaryWriter()
-      .tag(1, WireType.Varint)
-      .uint32(77)
-      .tag(15, WireType.LengthDelimited)
-      .string("future")
-      .tag(60, WireType.LengthDelimited)
-      .bytes(new TextEncoder().encode(secret))
-      .finish();
-    const agentBytes = new BinaryWriter()
-      .tag(2, WireType.LengthDelimited)
-      .bytes(execBytes)
-      .finish();
 
-    h.bridge.emit(fromBinary(AgentServerMessageSchema, agentBytes));
-    h.bridge.emit(create(AgentServerMessageSchema, { message: {
-      case: "execServerMessage",
-      value: create(ExecServerMessageSchema, {
-        id: 78,
-        execId: "late",
-        message: {
-          case: "mcpArgs",
-          value: create(McpArgsSchema, { toolCallId: "late-tool", toolName: "read" }),
-        },
-      }),
-    } }));
+    h.bridge.emit(unknownExecMessage(77, secret));
+    h.bridge.emit(deltaMessage("text", "continued-after-throw"));
     h.bridge.emitClose(0);
 
     const output = h.output.join("");
-    expect(output.match(/cursor_protocol_error/g)).toHaveLength(1);
+    expect(output).not.toContain("cursor_protocol_error");
+    expect(output).toContain("continued-after-throw");
     expect(output.match(/\[DONE\]/g)).toHaveLength(1);
-    expect(output).not.toContain("late-tool");
+    const replies = clientMessages(h.bridge).flatMap((message) =>
+      message.message.case === "execClientControlMessage" ? [message.message.value.message] : []);
+    expect(replies.map((reply) => [reply.case, reply.value?.id])).toEqual([["throw", 77], ["streamClose", 77]]);
+    expect(JSON.stringify(replies)).not.toContain(secret);
     expect(h.res.end).toHaveBeenCalledTimes(1);
     expect(h.req.listenerCount("close")).toBe(0);
     expect(h.res.listenerCount("close")).toBe(0);
@@ -544,7 +773,28 @@ describe("shutdown stream lifecycle", () => {
     expect(log).toContain('"fieldNumber":60');
     expect(log).toContain('"wireType":2');
     expect(log).toContain('"byteLength":23');
+    expect(log).toContain('"event":"exec.throw"');
+    expect(log).toContain('"event":"exec.stream_close"');
     expect(log).not.toContain(secret);
+  });
+
+  test("a reply frame that cannot be written still terminates once with a protocol error", () => {
+    const h = streamHarness();
+    h.bridge.write.mockImplementationOnce(() => { throw new Error("synthetic write failure"); });
+    h.bridge.emit(unknownExecMessage(79, "private-unwritable"));
+    h.bridge.emit(deltaMessage("text", "late-after-failure"));
+    h.bridge.emitClose(0);
+
+    const output = h.output.join("");
+    expect(output.match(/cursor_protocol_error/g)).toHaveLength(1);
+    expect(output.match(/\[DONE\]/g)).toHaveLength(1);
+    expect(output).not.toContain("late-after-failure");
+    expect(output).not.toContain("synthetic write failure");
+    expect(h.res.end).toHaveBeenCalledTimes(1);
+    expect(h.req.listenerCount("close")).toBe(0);
+    expect(h.res.listenerCount("close")).toBe(0);
+    expect(__testInternals.sessionBridges.has(h.bridgeKey)).toBe(false);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   test("shutdown terminates an active stream and clears timers and listeners", () => {

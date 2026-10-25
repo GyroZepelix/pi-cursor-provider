@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { streamSimple } from "@earendil-works/pi-ai/api/openai-completions";
-import type { Model } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError, type Model } from "@earendil-works/pi-ai";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import { parseCursorError } from "./cursor-errors.js";
 import { getProxyAuthToken, setBridgeFactoryForTests, startProxy, stopProxy } from "./proxy.js";
@@ -34,6 +34,7 @@ afterEach(() => {
   stopProxy();
   setBridgeFactoryForTests();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 describe("Cursor supplied error wording", () => {
@@ -163,6 +164,37 @@ describe("native error propagation through Pi", () => {
     expect(result.errorMessage).toBe(nativeMessage);
     expect(result.content).toEqual([]);
     expect(starts()).toBe(1);
+  });
+
+  test("a stalled Cursor stream surfaces as one Pi-retryable timeout error", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.stubEnv("PI_CURSOR_PROGRESS_TIMEOUT_MS", "100");
+    let starts = 0;
+    setBridgeFactoryForTests(() => {
+      starts++;
+      let alive = true;
+      let onClose: ((code: number) => void) | undefined;
+      const finish = () => {
+        if (!alive) return;
+        alive = false;
+        queueMicrotask(() => onClose?.(0));
+      };
+      // Upstream accepts the run and then makes no progress.
+      return {
+        get alive() { return alive; },
+        proc: { kill() { finish(); return true; } },
+        write() {}, end: finish, unref() {}, onData() {}, getStderr: () => ({}),
+        onClose(callback) { onClose = callback; },
+      };
+    });
+    const port = await startProxy(async () => "test");
+    const result = await streamSimple(model(port), {
+      messages: [{ role: "user", content: "synthetic test", timestamp: 0 }],
+    }, { apiKey: getProxyAuthToken() }).result();
+    expect(result.stopReason).toBe("error");
+    expect(result.errorMessage).toBe("Cursor stream timeout: no progress for 100ms");
+    expect(isRetryableAssistantError(result)).toBe(true);
+    expect(starts).toBe(1);
   });
 
   test("nonstreaming responses contain the same Cursor wording and Connect code", async () => {

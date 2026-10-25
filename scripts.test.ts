@@ -66,6 +66,72 @@ describe("debug timeline", () => {
       { fieldNumber: 60, wireType: 2, byteLength: 16 },
     ]);
   });
+
+  test("elevates progress timeouts and summarizes in-band replies, queries, and aborts", () => {
+    const root = mkdtempSync(join(tmpdir(), "cursor-timeline-test-"));
+    roots.push(root);
+    mkdirSync(join(root, "scripts"));
+    const script = join(root, "scripts", "debug-log-timeline.mjs");
+    copyFileSync(new URL("./scripts/debug-log-timeline.mjs", import.meta.url), script);
+    const log = join(root, "debug.log");
+    const base = { ts: "2026-10-25T08:00:00.000Z", requestId: "req-stall" };
+    writeFileSync(log, [
+      { ...base, event: "http.chat.body", body: { model: "synthetic", stream: true, messages: [{}] } },
+      { ...base, event: "exec.throw", execMessageId: 7, execId: "exec-7", execCase: "unknown", reason: "unknown_case" },
+      { ...base, event: "exec.stream_close", execMessageId: 7 },
+      { ...base, event: "exec.abort", execMessageId: 8, clearedWatchdog: false, abortedDelegated: true },
+      { ...base, event: "interaction.response", queryId: 1, queryCase: "webSearchRequestQuery", responseCase: "webSearchRequestResponse" },
+      { ...base, event: "interaction.unanswered", queryId: 2, queryCase: "setupVmEnvironmentArgs" },
+      { ...base, event: "tool_resume.skipped_aborted", execMessageId: 8 },
+      { ...base, event: "stream.progress_timeout", reason: "progress_timeout", limitMs: 180000, msSinceProgress: 180004,
+        lastProgressAt: "2026-10-25T07:57:00.000Z", frameCounts: { "update:heartbeat": 18, exec: 1 } },
+    ].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+
+    const text = spawnSync(process.execPath, [script, log], { encoding: "utf8" });
+    expect(text.status).toBe(0);
+    expect(text.stdout).toContain("PROGRESS_TIMEOUT(limit=180000ms, sinceProgress=180004ms, frames={update:heartbeat=18, exec=1})");
+    expect(text.stdout).not.toContain("STALL_TIMEOUT");
+    expect(text.stdout).toContain("throw:unknown:exec-7");
+    expect(text.stdout).toContain("streamClose:7");
+    expect(text.stdout).toContain("abort:8:delegated");
+    expect(text.stdout).toContain("query:webSearchRequestQuery->webSearchRequestResponse");
+    expect(text.stdout).toContain("UNANSWERED_QUERY:setupVmEnvironmentArgs");
+    expect(text.stdout).toContain("skippedAborted:8");
+
+    const json = spawnSync(process.execPath, [script, "--json", log], { encoding: "utf8" });
+    expect(json.status).toBe(0);
+    const summary = JSON.parse(json.stdout);
+    expect(summary.notableCounts).toMatchObject({
+      "stream.progress_timeout": 1,
+      "exec.throw": 1,
+      "exec.stream_close": 1,
+      "exec.abort": 1,
+      "interaction.response": 1,
+      "interaction.unanswered": 1,
+      "tool_resume.skipped_aborted": 1,
+    });
+    expect(summary.requests[0]).toMatchObject({
+      progressTimeout: true,
+      stall: { reason: "progress_timeout", limitMs: 180000 },
+    });
+  });
+});
+
+describe("live smoke opt-in", () => {
+  const script = new URL("./scripts/smoke-live.mjs", import.meta.url).pathname;
+  test.each([[[]], [["--tool"]], [["--web-search"]]])("refuses without --live: %j", (args) => {
+    const result = spawnSync(process.execPath, [script, ...args], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("--web-search");
+  });
+
+  test("rejects combining --tool and --web-search before loading credentials", () => {
+    const result = spawnSync(process.execPath, [script, "--live", "--tool", "--web-search"], {
+      encoding: "utf8", timeout: 5_000, env: { ...process.env, HOME: tmpdir() },
+    });
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("mutually exclusive");
+  });
 });
 
 describe("model snapshot refresh", () => {

@@ -20,12 +20,19 @@ const NOTABLE_EVENTS = [
   "stream.bridge_close",
   "nonstream.bridge_close",
   "stream.stall_timeout",
+  "stream.progress_timeout",
   "exec.received",
   "exec.response",
   "exec.delegated",
+  "exec.throw",
+  "exec.stream_close",
+  "exec.abort",
   "exec.unknown_fields",
   "exec.watchdog_expired",
   "exec.protocol_failure",
+  "interaction.response",
+  "interaction.unanswered",
+  "tool_resume.skipped_aborted",
   "session.cleanup",
   "session.cleanup_all",
   "conversation.evict",
@@ -124,6 +131,25 @@ function formatUnknownFields(fields) {
   ).join(",");
 }
 
+function formatFrameCounts(counts) {
+  if (!counts || typeof counts !== "object") return "";
+  return Object.entries(counts)
+    .filter(([, count]) => typeof count === "number")
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .map(([name, count]) => `${name}=${count}`)
+    .join(", ");
+}
+
+function stallSummary(event) {
+  return {
+    reason: event.reason ?? undefined,
+    limitMs: typeof event.limitMs === "number" ? event.limitMs : undefined,
+    msSinceProgress: typeof event.msSinceProgress === "number" ? event.msSinceProgress : undefined,
+    lastProgressAt: typeof event.lastProgressAt === "string" ? event.lastProgressAt : undefined,
+    frameCounts: event.frameCounts && typeof event.frameCounts === "object" ? event.frameCounts : undefined,
+  };
+}
+
 function parseLogFile(filePath) {
   const content = readFileSync(filePath, "utf8");
   const lines = content.split(/\r?\n/);
@@ -185,6 +211,9 @@ function summarize(events, filePath) {
         execEvents: [],
         protocolFailure: undefined,
         stallTimeout: false,
+        progressTimeout: false,
+        stall: undefined,
+        frameCounts: undefined,
       };
       requests.set(requestId, request);
       requestOrder.push(requestId);
@@ -318,6 +347,40 @@ function summarize(events, filePath) {
       case "stream.stall_timeout":
         if (!req) break;
         req.stallTimeout = true;
+        req.stall = stallSummary(event);
+        break;
+      case "stream.progress_timeout":
+        if (!req) break;
+        req.progressTimeout = true;
+        req.stall = stallSummary(event);
+        break;
+      case "stream.frame_summary":
+        if (!req) break;
+        req.frameCounts = stallSummary(event).frameCounts;
+        break;
+      case "exec.throw":
+        if (!req) break;
+        req.execEvents.push(`throw:${event.execCase ?? "unknown"}:${shortId(event.execId || event.execMessageId)}`);
+        break;
+      case "exec.stream_close":
+        if (!req) break;
+        req.execEvents.push(`streamClose:${event.execMessageId ?? "?"}`);
+        break;
+      case "exec.abort":
+        if (!req) break;
+        req.execEvents.push(`abort:${event.execMessageId ?? "?"}${event.abortedDelegated ? ":delegated" : ""}`);
+        break;
+      case "tool_resume.skipped_aborted":
+        if (!req) break;
+        req.execEvents.push(`skippedAborted:${event.execMessageId ?? "?"}`);
+        break;
+      case "interaction.response":
+        if (!req) break;
+        req.execEvents.push(`query:${event.queryCase ?? "unknown"}->${event.responseCase ?? "?"}`);
+        break;
+      case "interaction.unanswered":
+        if (!req) break;
+        req.execEvents.push(`UNANSWERED_QUERY:${event.queryCase ?? "unknown"}`);
         break;
       case "exec.received":
         if (!req) break;
@@ -410,7 +473,19 @@ function renderRequestLine(request, baseTsMs) {
     const fields = formatUnknownFields(request.protocolFailure.unknownFields);
     pieces.push(`PROTOCOL_FAILURE(code=${request.protocolFailure.code}${request.protocolFailure.execCase ? `, case=${request.protocolFailure.execCase}` : ""}${fields ? `, fields=[${fields}]` : ""})`);
   }
-  if (request.stallTimeout) pieces.push("STALL_TIMEOUT");
+  if (request.stallTimeout || request.progressTimeout) {
+    const label = request.progressTimeout ? "PROGRESS_TIMEOUT" : "STALL_TIMEOUT";
+    const stall = request.stall ?? {};
+    const bits = [];
+    if (stall.limitMs !== undefined) bits.push(`limit=${stall.limitMs}ms`);
+    if (stall.msSinceProgress !== undefined) bits.push(`sinceProgress=${stall.msSinceProgress}ms`);
+    const frames = formatFrameCounts(stall.frameCounts);
+    if (frames) bits.push(`frames={${frames}}`);
+    pieces.push(bits.length ? `${label}(${bits.join(", ")})` : label);
+  } else if (request.frameCounts) {
+    const frames = formatFrameCounts(request.frameCounts);
+    if (frames) pieces.push(`frames={${frames}}`);
+  }
 
   if (request.resumeToolResults.length > 0 || typeof request.pendingBeforeResume === "number") {
     const ids = request.resumeToolResults

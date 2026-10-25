@@ -1,0 +1,13 @@
+schema_version: 2
+id: 261025-0746-fix-cursor-stalls-after-tool-result-resume
+title: Fix Cursor stalls after tool-result resume
+kind: work-item
+work_type: other
+parent: null
+route: grill-to-spec
+status: completed
+superseded_by: null
+created_at: '2026-10-25T07:46:50+01:00'
+updated_at: '2026-10-25T09:24:15+01:00'
+external_refs: []
+wiki_refs: []

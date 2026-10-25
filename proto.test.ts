@@ -2,8 +2,17 @@ import { create, fromBinary, toBinary } from "@bufbuild/protobuf";
 import { BinaryWriter, WireType } from "@bufbuild/protobuf/wire";
 import { describe, expect, test } from "vitest";
 import {
+  AgentClientMessageSchema,
   AgentServerMessageSchema,
+  ExecClientControlMessageSchema,
   ExecClientMessageSchema,
+  ExecClientStreamCloseSchema,
+  ExecClientThrowSchema,
+  ExecServerAbortSchema,
+  ExecServerControlMessageSchema,
+  InteractionResponseSchema,
+  WebSearchRequestResponse_ApprovedSchema,
+  WebSearchRequestResponseSchema,
   ExecServerMessageSchema,
   McpStateExecArgsSchema,
   McpStateExecResultSchema,
@@ -133,5 +142,42 @@ describe("Cursor exec protocol bindings", () => {
     expect(decoded.message.case).toBe("execServerMessage");
     if (decoded.message.case !== "execServerMessage") throw new Error("unexpected case");
     expect(decoded.message.value.message.case).toBe("mcpStateExecArgs");
+  });
+
+  test("exec control and interaction replies use the vendored field numbers", () => {
+    // AgentClientMessage.exec_client_control_message = 5 { stream_close = 1 { id = 1 } }
+    const streamClose = toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, {
+      message: { case: "execClientControlMessage", value: create(ExecClientControlMessageSchema, {
+        message: { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id: 7 }) },
+      }) },
+    }));
+    expect(Array.from(streamClose)).toEqual([0x2a, 0x04, 0x0a, 0x02, 0x08, 0x07]);
+
+    // ExecClientControlMessage.throw = 2 { id = 1, error = 2 }
+    const thrown = toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, {
+      message: { case: "execClientControlMessage", value: create(ExecClientControlMessageSchema, {
+        message: { case: "throw", value: create(ExecClientThrowSchema, { id: 7, error: "x" }) },
+      }) },
+    }));
+    expect(Array.from(thrown)).toEqual([0x2a, 0x07, 0x12, 0x05, 0x08, 0x07, 0x12, 0x01, 0x78]);
+
+    // AgentClientMessage.interaction_response = 6 { id = 1, web_search_request_response = 2 { approved = 1 } }
+    const approved = toBinary(AgentClientMessageSchema, create(AgentClientMessageSchema, {
+      message: { case: "interactionResponse", value: create(InteractionResponseSchema, {
+        id: 3,
+        result: { case: "webSearchRequestResponse", value: create(WebSearchRequestResponseSchema, {
+          result: { case: "approved", value: create(WebSearchRequestResponse_ApprovedSchema, {}) },
+        }) },
+      }) },
+    }));
+    expect(Array.from(approved)).toEqual([0x32, 0x06, 0x08, 0x03, 0x12, 0x02, 0x0a, 0x00]);
+
+    // AgentServerMessage.exec_server_control_message = 5 { abort = 1 { id = 1 } }
+    const abort = fromBinary(AgentServerMessageSchema, new Uint8Array([0x2a, 0x04, 0x0a, 0x02, 0x08, 0x09]));
+    expect(abort.message.case).toBe("execServerControlMessage");
+    if (abort.message.case !== "execServerControlMessage") throw new Error("unexpected case");
+    expect(abort.message.value.message).toEqual(
+      create(ExecServerControlMessageSchema, { message: { case: "abort", value: create(ExecServerAbortSchema, { id: 9 }) } }).message,
+    );
   });
 });

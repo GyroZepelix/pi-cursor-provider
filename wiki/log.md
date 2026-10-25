@@ -34,3 +34,11 @@ Use this shape for new entries:
 - Wiki pages changed: `wiki/architecture.md`, `wiki/development.md`, `wiki/conventions/testing.md`, `wiki/conventions/security-and-state.md`, `wiki/index.md`, `wiki/log.md`, and `wiki/state.md`.
 - Verification: schema regeneration and focused protocol, proxy, lifecycle, and timeline tests passed during implementation; final whole-repository evidence is recorded separately in the active spec.
 - Notes: source and runtime behavior remain pinned to the reviewed schema commit. Live Cursor verification was not authorized and is not represented as deterministic coverage.
+
+## [2026-10-25] focused-ingest | Cursor stall bounds and in-band exec replies
+
+- Trigger: implementation of spec item `261025-0746-fix-cursor-stalls-after-tool-result-resume` changed durable protocol, lifecycle, diagnostic, and testing behavior.
+- Inputs: the item's `plan.md` and `verification.md`; `proxy.ts`; `scripts/debug-log-timeline.mjs`; `scripts/smoke-live.mjs`; `README.md`; synthetic tests in `index.test.ts`, `security.test.ts`, `proto.test.ts`, `scripts.test.ts`, and `errors.test.ts`.
+- Wiki pages changed: `wiki/architecture.md`, `wiki/development.md`, `wiki/conventions/testing.md`, `wiki/conventions/security-and-state.md`, `wiki/log.md`, and `wiki/state.md`.
+- Verification: offline type-check and full test suite passed; see the item's `verification.md`.
+- Notes: replaces the fail-closed exec invariant with in-band throw replies. Approved live smoke runs (tool replay and web search on `grok-4.7-fast`) passed with `stream_close` enabled; whether the change lowers the observed stall rate is unverified because the user waived the post-rollout session scan (plan D14).

@@ -24,9 +24,10 @@ Vitest suites are co-located at the repository root. They combine pure helper te
 
 ## Maintenance and diagnostics
 
-- `npm run debug:timeline -- --latest` reads the newest opt-in provider debug log and renders a timeline. It elevates protocol exec receipt, response/delegation, unknown field metadata, watchdog expiry, protocol termination, and stream stalls; it does not enable logging itself (`package.json`, `scripts/debug-log-timeline.mjs`).
+- `npm run debug:timeline -- --latest` reads the newest opt-in provider debug log and renders a timeline. It elevates protocol exec receipt, response/delegation, in-band throw replies, `stream_close` writes, aborts, interaction query responses and unanswered queries, unknown field metadata, watchdog expiry, protocol termination, and `STALL_TIMEOUT` (wire idle) or `PROGRESS_TIMEOUT` (no semantic progress) with limit, time since progress, and frame-class counts; it does not enable logging itself (`package.json`, `scripts/debug-log-timeline.mjs`).
+- Stall-related runtime switches: `PI_CURSOR_PROGRESS_TIMEOUT_MS` (default 180000, `0` disables) and `PI_CURSOR_EXEC_STREAM_CLOSE` (default on, `0`/`false` disables the exec completion marker). See the README configuration table (`README.md`, `proxy.ts`).
 - `npm run refresh-models` reads `~/.pi/agent/cursor-models-cache.json` and overwrites `cursor-models-raw.json` after strict normalization. Review the diff and catalog tests before committing (`scripts/refresh-models.mjs`, `scripts.test.ts`).
-- `npm run test:live -- --live [--tool] <model...>` accesses Cursor, requires existing authentication, and sends synthetic inference requests. It must remain explicit opt-in (`scripts/smoke-live.mjs`).
+- `npm run test:live -- --live [--tool | --web-search] <model...>` accesses Cursor, requires existing authentication, and sends synthetic inference requests. `--web-search` reports whether the run completed and whether a hosted web-search interaction query was observed (`not elicited` is not a failure). It must remain explicit opt-in (`scripts/smoke-live.mjs`, `scripts.test.ts`).
 
 ## Generated code
 

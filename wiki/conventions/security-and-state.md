@@ -12,13 +12,16 @@
 - Preserve the Cursor checkpoint through Pi compaction. It represents upstream conversation state and cannot be replaced reliably by a synthetic local reconstruction (`index.ts`, `README.md`).
 - Maintain at most one live bridge per session key. Cleanup sends cancellation, ends the bridge, and retains a bounded force-kill fallback (`proxy.ts`, `PLAN.md`, `security.test.ts`).
 - Retry only before text or reasoning output reaches the client. Replay from the pre-turn checkpoint so partial output is never duplicated (`proxy.ts`, `security.test.ts`).
-- Treat late callbacks after shutdown, disposal, or terminal protocol failure as inert; they must not repopulate state or start retries (`proxy.ts`, `security.test.ts`).
-- Fail closed on decoded-but-unsupported and unknown exec messages. Protocol failures are terminal and non-retryable, preserve the last good checkpoint, and clean bridge timers, listeners, and maps exactly once (`proxy.ts`, `index.test.ts`, `security.test.ts`).
+- Treat late callbacks after shutdown, disposal, terminal protocol failure, or stall termination as inert; they must not repopulate state or start retries (`proxy.ts`, `security.test.ts`).
+- Answer every answerable Cursor frame in band. Execs that cannot be answered or delegated receive a sanitized `ExecClientThrow` (no payload text) and the turn continues; exec replies are followed by `stream_close` unless disabled. Only an unwritable reply frame is a terminal, non-retryable protocol failure; it restores the pre-turn checkpoint and cleans bridge timers, listeners, and maps exactly once (`proxy.ts`, `index.test.ts`, `security.test.ts`). This replaced the earlier fail-closed exec termination (spec item `261025-0746-fix-cursor-stalls-after-tool-result-resume`).
+- A streaming turn must not wait indefinitely. Wire-idle or no-progress expiry emits exactly one Pi-retryable `cursor_stall_timeout` error plus `[DONE]`, keeps the last good checkpoint, performs no proxy-internal replay, and cleans up exactly once (`proxy.ts`, `security.test.ts`).
+- Never write a result or `stream_close` for a delegated exec that Cursor aborted (`proxy.ts`, `index.test.ts`).
 
 ## Debug data
 
 - Debug logging is disabled by default and may contain prompts, responses, or tool data when enabled (`README.md`, `proxy.ts`, `index.ts`).
 - Redact credentials and base64 image data. Summarize binary values rather than dumping them. Unknown exec diagnostics are restricted to field number, wire type, and byte length; never log retained raw unknown bytes (`proxy.ts`, `index.ts`, `proto.test.ts`).
+- Stall, throw, `stream_close`, abort, interaction query, and frame-count debug events carry metadata only (ids, cases, counts, timestamps, limits); interaction query and exec control frames are logged by case, not payload (`proxy.ts`, `security.test.ts`).
 - Write only to an owned regular file with mode `0600`; reject symlink and hardlink destinations and never fall back to printing sensitive payloads on write failure (`secure-log.ts`, `security.test.ts`).
 
 Changes to these invariants require focused negative tests in `security.test.ts` in addition to normal behavior coverage.

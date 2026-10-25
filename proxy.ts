@@ -37,7 +37,27 @@ import {
   AgentClientMessageSchema,
   AgentRunRequestSchema,
   AgentServerMessageSchema,
+  AskQuestionInteractionResponseSchema,
+  AskQuestionRejectedSchema,
+  AskQuestionResultSchema,
   CancelActionSchema,
+  CreatePlanErrorSchema,
+  CreatePlanRequestResponseSchema,
+  CreatePlanResultSchema,
+  ExaFetchRequestResponse_ApprovedSchema,
+  ExaFetchRequestResponseSchema,
+  ExaSearchRequestResponse_ApprovedSchema,
+  ExaSearchRequestResponseSchema,
+  ExecClientControlMessageSchema,
+  ExecClientStreamCloseSchema,
+  ExecClientThrowSchema,
+  InteractionResponseSchema,
+  SwitchModeRequestResponse_RejectedSchema,
+  SwitchModeRequestResponseSchema,
+  WebFetchRequestResponse_ApprovedSchema,
+  WebFetchRequestResponseSchema,
+  WebSearchRequestResponse_ApprovedSchema,
+  WebSearchRequestResponseSchema,
   ClientHeartbeatSchema,
   ConversationActionSchema,
   ConversationStateStructureSchema,
@@ -93,9 +113,14 @@ import {
   ConversationSummaryArchiveSchema,
   GetUsableModelsRequestSchema,
   GetUsableModelsResponseSchema,
+  type AgentClientMessage,
   type AgentServerMessage,
   type ConversationStateStructure,
+  type ExecClientControlMessage,
+  type ExecServerControlMessage,
   type ExecServerMessage,
+  type InteractionQuery,
+  type InteractionResponse,
   type KvServerMessage,
   type McpToolDefinition,
   type UserMessage,
@@ -164,6 +189,19 @@ interface PendingExec {
   toolCallId: string;
   toolName: string;
   decodedArgs: string;
+  /** Set when Cursor aborts this delegated exec; its result is then never written. */
+  aborted?: boolean;
+}
+
+interface DebugContext {
+  requestId?: string;
+  bridgeKey?: string;
+}
+
+/** Classification of one Cursor server frame for the semantic-progress watchdog. */
+interface FrameOutcome {
+  frameClass: string;
+  progress: boolean;
 }
 
 interface UnknownFieldSummary {
@@ -180,6 +218,9 @@ interface ExecLifecycle {
   ): void;
   onResponse(execMsg: ExecServerMessage, responseCase: string): void;
   onDelegation(execMsg: ExecServerMessage): void;
+  /** Clears watchdog entries for an aborted exec message id; true when any existed. */
+  onAbort(execMessageId: number): boolean;
+  readonly debugContext?: DebugContext;
 }
 
 class CursorProtocolFailure extends Error {
@@ -328,6 +369,8 @@ interface ParsedMessages {
 const activeBridges = new Map<string, ActiveBridge>();
 const sessionBridges = new Map<string, BridgeHandle>();
 const conversationStates = new Map<string, StoredConversation>();
+/** In-memory count of Cursor interaction query cases seen (metadata only; never output). */
+const interactionQueryStats = new Map<string, number>();
 let bridgeFactory: BridgeFactory = spawnBridge;
 let debugRequestCounter = 0;
 let debugLogFilePath: string | undefined;
@@ -425,6 +468,9 @@ export const __testInternals = {
   createControlExecLifecycle,
   buildMcpStateResult,
   summarizeUnknownFields,
+  interactionQueryStats,
+  progressTimeoutMs,
+  execStreamCloseEnabled,
 };
 
 export function setBridgeFactoryForTests(factory?: BridgeFactory): void {
@@ -1550,12 +1596,14 @@ function buildMcpToolDefinitions(tools: OpenAIToolDef[]): McpToolDefinition[] {
   });
 }
 
+// Throws when a value is neither a protobuf Value nor valid UTF-8 text; the
+// caller then answers the exec in band instead of delegating garbage to Pi.
 function decodeMcpArgValue(value: Uint8Array): unknown {
   try {
     const parsed = fromBinary(ValueSchema, value);
     return toJson(ValueSchema, parsed);
   } catch {}
-  return new TextDecoder().decode(value);
+  return new TextDecoder("utf-8", { fatal: true }).decode(value);
 }
 
 function decodeMcpArgsMap(
@@ -2021,8 +2069,9 @@ function processServerMessage(
   onMcpExec: (exec: PendingExec) => void,
   onCheckpoint?: (checkpointBytes: Uint8Array) => void,
   execLifecycle?: ExecLifecycle,
-): void {
+): FrameOutcome {
   const msgCase = msg.message.case;
+  const debugContext = execLifecycle?.debugContext;
   if (msgCase === "execServerMessage") {
     const execMsg = msg.message.value as ExecServerMessage;
     debugLog("server_message", {
@@ -2031,24 +2080,35 @@ function processServerMessage(
       execMessageId: execMsg.id,
       execCase: execMsg.message.case,
     });
+  } else if (msgCase === "interactionQuery") {
+    const query = msg.message.value as InteractionQuery;
+    debugLog("server_message", { msgCase, queryId: query.id, queryCase: query.query.case });
+  } else if (msgCase === "execServerControlMessage") {
+    const control = msg.message.value as ExecServerControlMessage;
+    debugLog("server_message", { msgCase, controlCase: control.message.case });
   } else {
     debugLog("server_message", { msgCase, msg });
   }
 
   if (msgCase === "interactionUpdate") {
     const update = msg.message.value as any;
-    const updateCase = update.message?.case;
-    if (updateCase === "textDelta") {
+    const updateCase: string | undefined = update.message?.case;
+    if (updateCase === "textDelta" || updateCase === "thinkingDelta") {
       const delta = update.message.value.text || "";
-      if (delta) onText(delta, false);
-    } else if (updateCase === "thinkingDelta") {
-      const delta = update.message.value.text || "";
-      if (delta) onText(delta, true);
-    } else if (updateCase === "tokenDelta") {
+      if (!delta) return { frameClass: "update:emptyDelta", progress: false };
+      onText(delta, updateCase === "thinkingDelta");
+      return { frameClass: `update:${updateCase}`, progress: true };
+    }
+    if (updateCase === "tokenDelta") {
       state.outputTokens += update.message.value.tokens ?? 0;
     }
+    return {
+      frameClass: `update:${updateCase ?? "unknown"}`,
+      progress: updateCase !== undefined && PROGRESS_UPDATE_CASES.has(updateCase),
+    };
   } else if (msgCase === "kvServerMessage") {
-    handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
+    const handled = handleKvMessage(msg.message.value as KvServerMessage, blobStore, sendFrame);
+    return { frameClass: handled ? "kv" : "kv:unknown", progress: handled };
   } else if (msgCase === "execServerMessage") {
     handleExecMessage(
       msg.message.value as ExecServerMessage,
@@ -2057,6 +2117,37 @@ function processServerMessage(
       onMcpExec,
       execLifecycle,
     );
+    return { frameClass: "exec", progress: true };
+  } else if (msgCase === "execServerControlMessage") {
+    const control = msg.message.value as ExecServerControlMessage;
+    if (control.message.case !== "abort") {
+      return { frameClass: "execControl:unknown", progress: false };
+    }
+    const execMessageId = control.message.value.id;
+    const clearedWatchdog = execLifecycle?.onAbort(execMessageId) ?? false;
+    let abortedDelegated = false;
+    for (const exec of state.pendingExecs) {
+      if (exec.execMsgId !== execMessageId || exec.aborted) continue;
+      exec.aborted = true;
+      abortedDelegated = true;
+    }
+    debugLog("exec.abort", {
+      ...debugContext,
+      execMessageId,
+      clearedWatchdog,
+      abortedDelegated,
+    });
+    return { frameClass: "execControl:abort", progress: true };
+  } else if (msgCase === "interactionQuery") {
+    const answered = handleInteractionQuery(
+      msg.message.value as InteractionQuery,
+      sendFrame,
+      debugContext,
+    );
+    return {
+      frameClass: answered ? "interactionQuery" : "interactionQuery:unanswered",
+      progress: answered,
+    };
   } else if (msgCase === "conversationCheckpointUpdate") {
     const stateStructure = msg.message.value as ConversationStateStructure;
     if ((stateStructure as any).tokenDetails) {
@@ -2067,7 +2158,174 @@ function processServerMessage(
     if (onCheckpoint) {
       onCheckpoint(toBinary(ConversationStateStructureSchema, stateStructure));
     }
+    return { frameClass: "checkpoint", progress: true };
   }
+  return { frameClass: `message:${msgCase ?? "unknown"}`, progress: false };
+}
+
+/** Interaction updates that represent semantic progress (heartbeats do not). */
+const PROGRESS_UPDATE_CASES = new Set<string>([
+  "tokenDelta",
+  "toolCallStarted",
+  "partialToolCall",
+  "toolCallDelta",
+  "toolCallCompleted",
+  "thinkingCompleted",
+  "stepStarted",
+  "stepCompleted",
+  "summary",
+  "summaryStarted",
+  "summaryCompleted",
+  "turnEnded",
+]);
+
+const INTERACTION_UNSUPPORTED_SUFFIX =
+  "not supported by this client. Use the available Pi tools instead.";
+
+/**
+ * Answers a Cursor interaction query in band so the Run stream is not left
+ * waiting. Hosted web access is approved; interactive questions, mode switches,
+ * and plan files are declined. VM setup has no truthful reply and unknown
+ * cases are left unanswered; the no-progress watchdog bounds that wait.
+ * Returns true when a response was written.
+ */
+function handleInteractionQuery(
+  query: InteractionQuery,
+  sendFrame: (data: Uint8Array) => void,
+  debugContext?: DebugContext,
+): boolean {
+  const queryCase = query.query.case;
+  const statsKey = queryCase ?? "unknown";
+  interactionQueryStats.set(statsKey, (interactionQueryStats.get(statsKey) ?? 0) + 1);
+  let result: InteractionResponse["result"] | undefined;
+  switch (queryCase) {
+    case "webSearchRequestQuery":
+      result = { case: "webSearchRequestResponse", value: create(WebSearchRequestResponseSchema, {
+        result: { case: "approved", value: create(WebSearchRequestResponse_ApprovedSchema, {}) },
+      }) };
+      break;
+    case "webFetchRequestQuery":
+      result = { case: "webFetchRequestResponse", value: create(WebFetchRequestResponseSchema, {
+        result: { case: "approved", value: create(WebFetchRequestResponse_ApprovedSchema, {}) },
+      }) };
+      break;
+    case "exaSearchRequestQuery":
+      result = { case: "exaSearchRequestResponse", value: create(ExaSearchRequestResponseSchema, {
+        result: { case: "approved", value: create(ExaSearchRequestResponse_ApprovedSchema, {}) },
+      }) };
+      break;
+    case "exaFetchRequestQuery":
+      result = { case: "exaFetchRequestResponse", value: create(ExaFetchRequestResponseSchema, {
+        result: { case: "approved", value: create(ExaFetchRequestResponse_ApprovedSchema, {}) },
+      }) };
+      break;
+    case "askQuestionInteractionQuery":
+      result = { case: "askQuestionInteractionResponse", value: create(AskQuestionInteractionResponseSchema, {
+        result: create(AskQuestionResultSchema, {
+          result: { case: "rejected", value: create(AskQuestionRejectedSchema, {
+            reason: `Interactive questions are ${INTERACTION_UNSUPPORTED_SUFFIX}`,
+          }) },
+        }),
+      }) };
+      break;
+    case "switchModeRequestQuery":
+      result = { case: "switchModeRequestResponse", value: create(SwitchModeRequestResponseSchema, {
+        result: { case: "rejected", value: create(SwitchModeRequestResponse_RejectedSchema, {
+          reason: `Mode switches are ${INTERACTION_UNSUPPORTED_SUFFIX}`,
+        }) },
+      }) };
+      break;
+    case "createPlanRequestQuery":
+      result = { case: "createPlanRequestResponse", value: create(CreatePlanRequestResponseSchema, {
+        result: create(CreatePlanResultSchema, {
+          result: { case: "error", value: create(CreatePlanErrorSchema, {
+            error: `Plan files are ${INTERACTION_UNSUPPORTED_SUFFIX}`,
+          }) },
+        }),
+      }) };
+      break;
+    default:
+      // setupVmEnvironmentArgs (success-only result) and unknown cases.
+      break;
+  }
+  if (!result) {
+    debugLog("interaction.unanswered", { ...debugContext, queryId: query.id, queryCase: statsKey });
+    return false;
+  }
+  try {
+    sendFrame(frameClientMessage({
+      case: "interactionResponse",
+      value: create(InteractionResponseSchema, { id: query.id, result }),
+    }));
+  } catch {
+    throw new CursorProtocolFailure(
+      "cursor_protocol_error",
+      "Cursor protocol response could not be written.",
+      queryCase,
+    );
+  }
+  debugLog("interaction.response", {
+    ...debugContext,
+    queryId: query.id,
+    queryCase: statsKey,
+    responseCase: result.case,
+  });
+  return true;
+}
+
+function frameClientMessage(message: AgentClientMessage["message"]): Buffer {
+  const clientMessage = create(AgentClientMessageSchema, { message });
+  return frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage));
+}
+
+/** `PI_CURSOR_EXEC_STREAM_CLOSE=0|false` disables the exec completion marker. */
+function execStreamCloseEnabled(): boolean {
+  const raw = process.env.PI_CURSOR_EXEC_STREAM_CLOSE?.trim().toLowerCase();
+  return raw !== "0" && raw !== "false";
+}
+
+function sendExecControl(
+  message: ExecClientControlMessage["message"],
+  sendFrame: (data: Uint8Array) => void,
+): void {
+  sendFrame(frameClientMessage({
+    case: "execClientControlMessage",
+    value: create(ExecClientControlMessageSchema, { message }),
+  }));
+}
+
+/** Marks the exec reply for `id` complete, unless disabled by environment. */
+function sendExecStreamClose(
+  id: number,
+  sendFrame: (data: Uint8Array) => void,
+  debugContext?: DebugContext,
+): void {
+  if (!execStreamCloseEnabled()) return;
+  sendExecControl(
+    { case: "streamClose", value: create(ExecClientStreamCloseSchema, { id }) },
+    sendFrame,
+  );
+  debugLog("exec.stream_close", { ...debugContext, execMessageId: id });
+}
+
+/** Writes one typed exec result followed by its completion marker. */
+function sendExecReply(
+  id: number,
+  execId: string,
+  messageCase: string,
+  value: unknown,
+  sendFrame: (data: Uint8Array) => void,
+  debugContext?: DebugContext,
+): void {
+  sendFrame(frameClientMessage({
+    case: "execClientMessage",
+    value: create(ExecClientMessageSchema, {
+      id,
+      execId,
+      message: { case: messageCase as any, value: value as any },
+    }),
+  }));
+  sendExecStreamClose(id, sendFrame, debugContext);
 }
 
 function sendKvResponse(
@@ -2090,7 +2348,7 @@ function handleKvMessage(
   kvMsg: KvServerMessage,
   blobStore: Map<string, Uint8Array>,
   sendFrame: (data: Uint8Array) => void,
-): void {
+): boolean {
   const kvCase = (kvMsg as any).message.case;
   if (kvCase === "getBlobArgs") {
     const blobId = (kvMsg as any).message.value.blobId;
@@ -2111,7 +2369,10 @@ function handleKvMessage(
       create(SetBlobResultSchema, {}),
       sendFrame,
     );
+  } else {
+    return false;
   }
+  return true;
 }
 
 function summarizeUnknownFields(execMsg: ExecServerMessage): UnknownFieldSummary[] {
@@ -2165,27 +2426,46 @@ function handleExecMessage(
   const unknownFields = summarizeUnknownFields(execMsg);
   lifecycle?.onReceipt(execMsg, execCase, unknownFields);
 
+  const debugContext = lifecycle?.debugContext;
+  const writeFailure = () => new CursorProtocolFailure(
+    "cursor_protocol_error",
+    "Cursor protocol response could not be written.",
+    execCase,
+    unknownFields,
+  );
   const respond = (messageCase: string, value: unknown): void => {
     try {
-      sendExecResult(execMsg, messageCase, value, sendFrame);
+      sendExecReply(execMsg.id, execMsg.execId, messageCase, value, sendFrame, debugContext);
     } catch {
-      throw new CursorProtocolFailure(
-        "cursor_protocol_error",
-        "Cursor protocol response could not be written.",
-        execCase,
-        unknownFields,
-      );
+      throw writeFailure();
     }
     lifecycle?.onResponse(execMsg, messageCase);
   };
+  // In-band failure for an exec this client cannot answer or delegate, matching
+  // Cursor's own executor: throw, then the completion marker. The turn continues.
+  const respondThrow = (error: string, reason: string): void => {
+    try {
+      sendExecControl(
+        { case: "throw", value: create(ExecClientThrowSchema, { id: execMsg.id, error }) },
+        sendFrame,
+      );
+      sendExecStreamClose(execMsg.id, sendFrame, debugContext);
+    } catch {
+      throw writeFailure();
+    }
+    debugLog("exec.throw", {
+      ...debugContext,
+      execMessageId: execMsg.id,
+      execId: execMsg.execId,
+      execCase: execCase ?? "unknown",
+      reason,
+    });
+    lifecycle?.onResponse(execMsg, "throw");
+  };
 
   if (execCase === undefined) {
-    throw new CursorProtocolFailure(
-      "cursor_protocol_error",
-      "Cursor sent an unsupported protocol message.",
-      undefined,
-      unknownFields,
-    );
+    respondThrow("Unsupported Cursor exec message.", "unknown_case");
+    return;
   }
 
   const REJECT_REASON =
@@ -2223,14 +2503,20 @@ function handleExecMessage(
 
   if (execCase === "mcpArgs") {
     const mcpArgs = execMsg.message.value;
+    let decodedArgs: string;
     try {
-      const decoded = decodeMcpArgsMap(mcpArgs.args ?? {});
+      decodedArgs = JSON.stringify(decodeMcpArgsMap(mcpArgs.args ?? {}));
+    } catch {
+      respondThrow("Tool arguments could not be decoded.", "undecodable_mcp_args");
+      return;
+    }
+    try {
       onMcpExec({
         execId: execMsg.execId,
         execMsgId: execMsg.id,
         toolCallId: mcpArgs.toolCallId || crypto.randomUUID(),
         toolName: mcpArgs.toolName || mcpArgs.name,
-        decodedArgs: JSON.stringify(decoded),
+        decodedArgs,
       });
     } catch {
       throw new CursorProtocolFailure(
@@ -2377,31 +2663,7 @@ function handleExecMessage(
     return;
   }
 
-  throw new CursorProtocolFailure(
-    "cursor_protocol_error",
-    "Cursor sent an unsupported protocol message.",
-    execCase,
-    unknownFields,
-  );
-}
-
-function sendExecResult(
-  execMsg: ExecServerMessage,
-  messageCase: string,
-  value: unknown,
-  sendFrame: (data: Uint8Array) => void,
-): void {
-  const execClientMessage = create(ExecClientMessageSchema, {
-    id: (execMsg as any).id,
-    execId: (execMsg as any).execId,
-    message: { case: messageCase as any, value: value as any },
-  });
-  const clientMessage = create(AgentClientMessageSchema, {
-    message: { case: "execClientMessage", value: execClientMessage },
-  });
-  sendFrame(
-    frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
-  );
+  respondThrow(`Unsupported Cursor exec: ${execCase}.`, "unsupported_case");
 }
 
 // ── Key derivation ──
@@ -2834,6 +3096,23 @@ function controlExecTimeoutMs(): number {
   return parseInt(process.env.PI_CURSOR_BRIDGE_STALL_TIMEOUT_MS ?? "") || 120_000;
 }
 
+const DEFAULT_PROGRESS_TIMEOUT_MS = 180_000;
+
+/**
+ * Semantic no-progress window for streaming turns. `0` disables it; empty,
+ * negative, or non-numeric values fall back to the default.
+ */
+function progressTimeoutMs(): number {
+  const raw = process.env.PI_CURSOR_PROGRESS_TIMEOUT_MS?.trim() ?? "";
+  if (!/^\d+$/.test(raw)) return DEFAULT_PROGRESS_TIMEOUT_MS;
+  // Timers overflow above 2^31-1 ms and would fire immediately.
+  return Math.min(Number(raw), 2_147_483_647);
+}
+
+function formatLimit(ms: number): string {
+  return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+
 function execMessageIdentity(execMsg: ExecServerMessage): string {
   return `${execMsg.id}:${execMsg.execId}`;
 }
@@ -2854,6 +3133,7 @@ function createControlExecLifecycle(options: {
   };
 
   return {
+    debugContext: { requestId: options.requestId, bridgeKey: options.bridgeKey },
     onReceipt(execMsg, execCase, unknownFields) {
       const identity = execMessageIdentity(execMsg);
       debugLog("exec.received", {
@@ -2914,6 +3194,16 @@ function createControlExecLifecycle(options: {
         execId: execMsg.execId,
         execCase: execMsg.message.case,
       });
+    },
+    onAbort(execMessageId) {
+      let cleared = false;
+      for (const [identity, timer] of pending) {
+        if (!identity.startsWith(`${execMessageId}:`)) continue;
+        clearTimeout(timer);
+        pending.delete(identity);
+        cleared = true;
+      }
+      return cleared;
     },
     clearAll() {
       for (const timer of pending.values()) clearTimeout(timer);
@@ -2983,7 +3273,9 @@ function writeSSEStream(
   }
 
   let closed = false;
-  let protocolTerminated = false;
+  // Set once the proxy ends the turn with an explicit error (protocol failure
+  // or stall); afterwards frames and close callbacks are inert.
+  let terminated = false;
   let controlExecLifecycle: ReturnType<typeof createControlExecLifecycle> | undefined;
   const STALL_TIMEOUT_MS = controlExecTimeoutMs();
   let keepAliveTimer: ReturnType<typeof setInterval> | undefined;
@@ -3000,7 +3292,14 @@ function writeSSEStream(
     closed = true;
     clearInterval(keepAliveTimer);
     if (stallTimer) clearTimeout(stallTimer);
+    if (progressTimer) clearTimeout(progressTimer);
     controlExecLifecycle?.clearAll();
+    debugLog("stream.frame_summary", {
+      requestId,
+      bridgeKey,
+      frameCounts: { ...frameCounts },
+      lastProgressAt: new Date(lastProgressAt).toISOString(),
+    });
     res.end();
   };
 
@@ -3048,27 +3347,85 @@ function writeSSEStream(
   }, 15_000);
   keepAliveTimer.unref();
 
-  // Stall detector: kill the bridge if no data arrives from Cursor for too
-  // long.  This catches cases where the H2 connection is technically alive
+  // Wire-idle stall detector: end the turn if no data arrives from Cursor for
+  // too long.  This catches cases where the H2 connection is technically alive
   // but Cursor's server is stuck processing a stale conversation checkpoint.
-  // Reset on every incoming Connect frame.
+  // Reset on every incoming Connect frame, including heartbeats.
   let stallTimer: ReturnType<typeof setTimeout> | undefined;
   const resetStallTimer = () => {
     if (stallTimer) clearTimeout(stallTimer);
+    stallTimer = undefined;
+    if (closed || terminated || cancelled) return;
     stallTimer = setTimeout(() => {
-      if (cancelled || closed) return;
-      debugLog("stream.stall_timeout", { requestId, bridgeKey, convKey, modelId });
+      if (cancelled || closed || terminated) return;
       console.error(
         `[cursor-provider] Bridge stalled for ${STALL_TIMEOUT_MS / 1000}s \u2014 killing (${modelId})`,
       );
-      cleanupBridge(activeBridge, activeHeartbeatTimer, bridgeKey);
+      terminateStall("wire_idle", STALL_TIMEOUT_MS);
     }, STALL_TIMEOUT_MS);
     stallTimer.unref?.();
   };
 
+  // Semantic-progress watchdog: heartbeats keep the wire busy without moving
+  // the turn forward, so only progress frames reset this window.
+  const PROGRESS_TIMEOUT_MS = progressTimeoutMs();
+  const frameCounts: Record<string, number> = {};
+  let lastProgressAt = Date.now();
+  let progressTimer: ReturnType<typeof setTimeout> | undefined;
+  const resetProgressTimer = () => {
+    lastProgressAt = Date.now();
+    if (progressTimer) clearTimeout(progressTimer);
+    progressTimer = undefined;
+    if (PROGRESS_TIMEOUT_MS <= 0 || closed || terminated || cancelled) return;
+    progressTimer = setTimeout(
+      () => terminateStall("progress_timeout", PROGRESS_TIMEOUT_MS),
+      PROGRESS_TIMEOUT_MS,
+    );
+    progressTimer.unref?.();
+  };
+
+  // Ends a stalled turn with exactly one Pi-retryable error (its message
+  // contains "timeout"). The last good checkpoint is kept; there is no
+  // proxy-internal replay, and later frames or close callbacks stay inert.
+  const terminateStall = (
+    reason: "progress_timeout" | "wire_idle",
+    limitMs: number,
+  ): void => {
+    if (terminated || closed || cancelled) return;
+    terminated = true;
+    retryableConnectError = false;
+    controlExecLifecycle?.clearAll();
+    req.removeListener("close", onClientClose);
+    res.removeListener("close", onClientClose);
+    debugLog(reason === "progress_timeout" ? "stream.progress_timeout" : "stream.stall_timeout", {
+      requestId,
+      bridgeKey,
+      convKey,
+      modelId,
+      reason,
+      limitMs,
+      lastProgressAt: new Date(lastProgressAt).toISOString(),
+      msSinceProgress: Date.now() - lastProgressAt,
+      frameCounts: { ...frameCounts },
+    });
+    const limit = formatLimit(limitMs);
+    sendSSE({
+      error: {
+        message: reason === "progress_timeout"
+          ? `Cursor stream timeout: no progress for ${limit}`
+          : `Cursor stream timeout: no data for ${limit}`,
+        type: "upstream_error",
+        code: "cursor_stall_timeout",
+      },
+    });
+    sendDone();
+    closeResponse();
+    cleanupBridge(activeBridge, activeHeartbeatTimer, bridgeKey);
+  };
+
   // Detect client disconnect (e.g. user pressed Escape in pi)
   const onClientClose = () => {
-    if (cancelled || closed || protocolTerminated) return;
+    if (cancelled || closed || terminated) return;
     debugLog("stream.client_close", { requestId, bridgeKey, convKey });
     cancelled = true;
     cleanupBridge(activeBridge, activeHeartbeatTimer, bridgeKey);
@@ -3078,8 +3435,8 @@ function writeSSEStream(
   res.on("close", onClientClose);
 
   const terminateProtocolFailure = (failure: CursorProtocolFailure): void => {
-    if (protocolTerminated || closed || cancelled) return;
-    protocolTerminated = true;
+    if (terminated || closed || cancelled) return;
+    terminated = true;
     retryableConnectError = false;
     controlExecLifecycle?.clearAll();
     req.removeListener("close", onClientClose);
@@ -3128,17 +3485,18 @@ function writeSSEStream(
     let contentSent = false;
     mcpExecReceived = false;
     resetStallTimer();
+    resetProgressTimer();
 
     const processChunk = createConnectFrameParser(
       (messageBytes) => {
-        if (disposedBridges.has(activeBridge) || protocolTerminated) return;
+        if (disposedBridges.has(activeBridge) || terminated) return;
         resetStallTimer();
         try {
           const serverMessage = fromBinary(
             AgentServerMessageSchema,
             messageBytes,
           );
-          processServerMessage(
+          const outcome = processServerMessage(
             serverMessage,
             blobStore,
             mcpTools,
@@ -3240,6 +3598,8 @@ function writeSSEStream(
             },
             controlExecLifecycle,
           );
+          frameCounts[outcome.frameClass] = (frameCounts[outcome.frameClass] ?? 0) + 1;
+          if (outcome.progress) resetProgressTimer();
         } catch (err) {
           if (err instanceof CursorProtocolFailure) {
             terminateProtocolFailure(err);
@@ -3252,11 +3612,13 @@ function writeSSEStream(
         }
       },
       (endStreamBytes) => {
-        if (disposedBridges.has(activeBridge) || protocolTerminated) return;
+        if (disposedBridges.has(activeBridge) || terminated) return;
         resetStallTimer();
         const endError = parseConnectEndStream(endStreamBytes);
         clearInterval(activeHeartbeatTimer);
         if (stallTimer) clearTimeout(stallTimer);
+        // The stream has ended; a pending transparent retry re-arms this.
+        if (progressTimer) clearTimeout(progressTimer);
         if (endError) {
           if (endError.retryable && !contentSent && !closed && accessToken && retryCount < MAX_BRIDGE_RETRIES) {
             debugLog("stream.retryable_connect_error", {
@@ -3317,9 +3679,10 @@ function writeSSEStream(
       clearTimeout(bridgeKillTimers.get(activeBridge));
       bridgeKillTimers.delete(activeBridge);
       if (stallTimer) clearTimeout(stallTimer);
+      if (progressTimer) clearTimeout(progressTimer);
       controlExecLifecycle?.clearAll();
       if (sessionBridges.get(bridgeKey) === activeBridge) sessionBridges.delete(bridgeKey);
-      if (protocolTerminated) {
+      if (terminated) {
         req.removeListener("close", onClientClose);
         res.removeListener("close", onClientClose);
         closeResponse();
@@ -3552,6 +3915,17 @@ function handleToolResultResume(
   for (const exec of pendingExecs) {
     const result = turnResults.get(exec.toolCallId);
     if (!result) continue;
+    if (exec.aborted) {
+      // Cursor aborted this exec while Pi ran it; writing a result (or its
+      // completion marker) for an aborted id would answer a closed exchange.
+      debugLog("tool_resume.skipped_aborted", {
+        requestId,
+        bridgeKey,
+        execMessageId: exec.execMsgId,
+        execId: exec.execId,
+      });
+      continue;
+    }
     const mcpResult = create(McpResultSchema, {
       result: {
         case: "success",
@@ -3569,16 +3943,13 @@ function handleToolResultResume(
       },
     });
 
-    const execClientMessage = create(ExecClientMessageSchema, {
-      id: exec.execMsgId,
-      execId: exec.execId,
-      message: { case: "mcpResult" as any, value: mcpResult as any },
-    });
-    const clientMessage = create(AgentClientMessageSchema, {
-      message: { case: "execClientMessage", value: execClientMessage },
-    });
-    bridge.write(
-      frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)),
+    sendExecReply(
+      exec.execMsgId,
+      exec.execId,
+      "mcpResult",
+      mcpResult,
+      (data) => bridge.write(data),
+      { requestId, bridgeKey },
     );
     debugLog("tool_resume.sent_result", { requestId, exec, result });
   }
@@ -3738,32 +4109,20 @@ async function handleNonStreamingResponse(
               (exec) => {
                 // Non-streaming mode cannot pause for tool calls. Reject each
                 // exec request immediately so Cursor can complete the turn.
-                const execClientMessage = create(ExecClientMessageSchema, {
-                  id: exec.execMsgId,
-                  execId: exec.execId,
-                  message: {
-                    case: "mcpResult" as any,
-                    value: create(McpResultSchema, {
-                      result: {
-                        case: "error",
-                        value: create(McpErrorSchema, {
-                          error:
-                            "Tool calls not supported in non-streaming mode",
-                        }),
-                      },
-                    }) as any,
-                  },
-                });
-                const clientMessage = create(AgentClientMessageSchema, {
-                  message: {
-                    case: "execClientMessage",
-                    value: execClientMessage,
-                  },
-                });
-                bridge.write(
-                  frameConnectMessage(
-                    toBinary(AgentClientMessageSchema, clientMessage),
-                  ),
+                sendExecReply(
+                  exec.execMsgId,
+                  exec.execId,
+                  "mcpResult",
+                  create(McpResultSchema, {
+                    result: {
+                      case: "error",
+                      value: create(McpErrorSchema, {
+                        error: "Tool calls not supported in non-streaming mode",
+                      }),
+                    },
+                  }),
+                  (data) => bridge.write(data),
+                  { requestId, bridgeKey },
                 );
                 debugLog("nonstream.exec_rejected", { requestId, exec });
               },

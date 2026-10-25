@@ -9,7 +9,11 @@ import { randomUUID } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 if (!process.argv.includes("--live")) {
-  console.error("Live inference is opt in: node scripts/smoke-live.mjs --live [--tool] [model IDs...]");
+  console.error("Live inference is opt in: node scripts/smoke-live.mjs --live [--tool | --web-search] [model IDs...]");
+  process.exit(2);
+}
+if (process.argv.includes("--tool") && process.argv.includes("--web-search")) {
+  console.error("--tool and --web-search are mutually exclusive");
   process.exit(2);
 }
 process.env.PI_CURSOR_PROVIDER_DEBUG = "0";
@@ -34,6 +38,11 @@ const hooks = new Map();
 const requested = process.argv.slice(2).filter(arg => !arg.startsWith("--"));
 const modelIds = requested.length ? requested : ["cursor-grok-4.6", "claude-fable-5-1", "gpt-5.6-sol"];
 const toolMode = process.argv.includes("--tool");
+// Synthetic prompt likely to trigger Cursor's hosted web search interaction
+// query. Not eliciting a query is recorded, not treated as a failure.
+const webSearchMode = process.argv.includes("--web-search");
+const mode = toolMode ? "tool-replay" : webSearchMode ? "web-search" : "text";
+const interactionQueryCounts = () => Object.fromEntries(proxy.__testInternals.interactionQueryStats);
 const results = [];
 try {
   await extension.default({
@@ -58,13 +67,16 @@ try {
       systemPrompt: "This is a synthetic connectivity test. No files, secrets, or real user data are involved.",
       messages: [{ role: "user", content: toolMode
         ? "Call echo_probe with value probe, then reply with exactly CURSOR_SMOKE_OK after its result."
-        : "Reply with exactly CURSOR_SMOKE_OK.", timestamp: Date.now() }],
+        : webSearchMode
+          ? "Use web search to look up the latest released version of Node.js, then reply with CURSOR_SMOKE_OK followed by that version."
+          : "Reply with exactly CURSOR_SMOKE_OK.", timestamp: Date.now() }],
       ...(tools && { tools }),
     };
     const run = async () => {
       const events = [];
       const stream = streamSimple(model, context, {
-        apiKey: proxyCredential, reasoning: "low", maxTokens: 512, signal: AbortSignal.timeout(60_000),
+        apiKey: proxyCredential, reasoning: "low", maxTokens: 512,
+        signal: AbortSignal.timeout(webSearchMode ? 240_000 : 60_000),
         onPayload(payload) {
           const ctx = { model, sessionManager: { getSessionId: () => sessionId } };
           return hooks.get("before_provider_request")?.({ payload }, ctx) ?? payload;
@@ -75,6 +87,7 @@ try {
       assert(!["error", "aborted"].includes(message.stopReason), message.errorMessage ?? message.stopReason);
       return { message, events };
     };
+    proxy.__testInternals.interactionQueryStats.clear();
     try {
       const first = await run();
       let last = first;
@@ -92,9 +105,17 @@ try {
       }
       const text = last.message.content.filter(block => block.type === "text").map(block => block.text).join("");
       assert(text.includes("CURSOR_SMOKE_OK"), "Missing synthetic success marker");
-      results.push({ id, mode: toolMode ? "tool-replay" : "text", ok: true, stopReason: last.message.stopReason, totalTokens: last.message.usage.totalTokens, streamed: last.events.includes("text_delta") });
+      const queries = interactionQueryCounts();
+      results.push({
+        id, mode, ok: true, stopReason: last.message.stopReason, totalTokens: last.message.usage.totalTokens,
+        streamed: last.events.includes("text_delta"),
+        ...(webSearchMode && { interactionQueries: queries, interactionQuery: Object.keys(queries).length > 0 ? "observed" : "not elicited" }),
+      });
     } catch (error) {
-      results.push({ id, mode: toolMode ? "tool-replay" : "text", ok: false, error: error instanceof Error ? error.message : "Smoke test failed" });
+      results.push({
+        id, mode, ok: false, error: error instanceof Error ? error.message : "Smoke test failed",
+        ...(webSearchMode && { interactionQueries: interactionQueryCounts() }),
+      });
       process.exitCode = 1;
     } finally {
       proxy.cleanupSessionState(sessionId);
